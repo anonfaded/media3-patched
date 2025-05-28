@@ -840,7 +840,7 @@ public class BoxesTest {
 
   @Test
   public void createTfhdBox_matchesExpected() throws IOException {
-    ByteBuffer tfhdBox = Boxes.tfhd(/* trackId= */ 1, /* baseDataOffset= */ 1_000L);
+    ByteBuffer tfhdBox = Boxes.tfhd(/* trackId= */ 1);
 
     DumpableMp4Box dumpableBox = new DumpableMp4Box(tfhdBox);
     DumpFileAsserts.assertOutput(

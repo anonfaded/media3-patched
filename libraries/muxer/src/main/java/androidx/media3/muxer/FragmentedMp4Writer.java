@@ -234,7 +234,7 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
       ProcessedTrackInfo currentTrackInfo = trackInfos.get(i);
       trafBoxes.add(
           Boxes.traf(
-              Boxes.tfhd(currentTrackInfo.trackId, /* baseDataOffset= */ moofBoxStartPosition),
+              Boxes.tfhd(currentTrackInfo.trackId),
               Boxes.tfdt(currentTrackInfo.fragmentPts),
               Boxes.trun(
                   currentTrackInfo.trackFormat,
