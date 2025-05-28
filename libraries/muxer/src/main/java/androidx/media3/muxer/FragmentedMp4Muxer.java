@@ -22,6 +22,7 @@ import android.util.SparseArray;
 import androidx.media3.common.Format;
 import androidx.media3.common.Metadata;
 import androidx.media3.common.MimeTypes;
+import androidx.media3.common.util.Consumer;
 import androidx.media3.common.util.UnstableApi;
 import androidx.media3.container.MdtaMetadataEntry;
 import androidx.media3.container.Mp4LocationData;
@@ -90,7 +91,7 @@ public final class FragmentedMp4Muxer implements Muxer {
 
   /** A builder for {@link FragmentedMp4Muxer} instances. */
   public static final class Builder {
-    private final OutputStream outputStream;
+    private final Consumer<ProcessedSegment> framgentConsumer;
 
     private long fragmentDurationMs;
     private boolean sampleCopyEnabled;
@@ -98,11 +99,11 @@ public final class FragmentedMp4Muxer implements Muxer {
     /**
      * Creates a {@link Builder} instance with default values.
      *
-     * @param outputStream The {@link OutputStream} to write the media data to. This stream will be
+     * @param framgentConsumer Consumer to generate mp4 files.
      *     automatically closed by the muxer when {@link FragmentedMp4Muxer#close()} is called.
      */
-    public Builder(OutputStream outputStream) {
-      this.outputStream = outputStream;
+    public Builder(Consumer<ProcessedSegment> framgentConsumer) {
+      this.framgentConsumer = framgentConsumer;
       fragmentDurationMs = DEFAULT_FRAGMENT_DURATION_MS;
       sampleCopyEnabled = true;
     }
@@ -139,7 +140,7 @@ public final class FragmentedMp4Muxer implements Muxer {
 
     /** Builds a {@link FragmentedMp4Muxer} instance. */
     public FragmentedMp4Muxer build() {
-      return new FragmentedMp4Muxer(outputStream, fragmentDurationMs, sampleCopyEnabled);
+      return new FragmentedMp4Muxer(framgentConsumer, fragmentDurationMs, sampleCopyEnabled);
     }
   }
 
@@ -173,7 +174,7 @@ public final class FragmentedMp4Muxer implements Muxer {
   private final SparseArray<Track> trackIdToTrack;
 
   private FragmentedMp4Muxer(
-      OutputStream outputStream, long fragmentDurationMs, boolean sampleCopyEnabled) {
+      Consumer<ProcessedSegment> outputStream, long fragmentDurationMs, boolean sampleCopyEnabled) {
     checkNotNull(outputStream);
     metadataCollector = new MetadataCollector();
     fragmentedMp4Writer =

@@ -33,13 +33,12 @@ import static java.lang.Math.min;
 import androidx.media3.common.C;
 import androidx.media3.common.Format;
 import androidx.media3.common.MimeTypes;
+import androidx.media3.common.util.Consumer;
 import androidx.media3.common.util.Util;
 import com.google.common.collect.ImmutableList;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
-import java.nio.channels.Channels;
-import java.nio.channels.WritableByteChannel;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -109,8 +108,8 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
     }
   }
 
-  private final PositionTrackingOutputStream outputStream;
-  private final WritableByteChannel outputChannel;
+  private final Consumer<ProcessedSegment> segmentConsumer;
+
   private final MetadataCollector metadataCollector;
   private final AnnexBToAvccConverter annexBToAvccConverter;
   private final long fragmentDurationUs;
@@ -129,7 +128,7 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
   /**
    * Creates an instance.
    *
-   * @param outputStream The {@link OutputStream} to write the data to.
+   * @param segmentConsumer Consumer to generate actual m4s segments and HLS manifest.
    * @param metadataCollector A {@link MetadataCollector}.
    * @param annexBToAvccConverter The {@link AnnexBToAvccConverter} to be used to convert H.264 and
    *     H.265 NAL units from the Annex-B format (using start codes to delineate NAL units) to the
@@ -138,13 +137,14 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
    * @param sampleCopyEnabled Whether sample copying is enabled.
    */
   public FragmentedMp4Writer(
-      OutputStream outputStream,
+      Consumer<ProcessedSegment> segmentConsumer,
       MetadataCollector metadataCollector,
       AnnexBToAvccConverter annexBToAvccConverter,
       long fragmentDurationMs,
       boolean sampleCopyEnabled) {
-    this.outputStream = new PositionTrackingOutputStream(outputStream);
-    this.outputChannel = Channels.newChannel(this.outputStream);
+
+    this.segmentConsumer = segmentConsumer;
+
     this.metadataCollector = metadataCollector;
     this.annexBToAvccConverter = annexBToAvccConverter;
     this.fragmentDurationUs = fragmentDurationMs * 1_000;
@@ -217,13 +217,11 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
     try {
       createFragment();
     } finally {
-      outputChannel.close();
-      outputStream.close();
     }
   }
 
   private static ImmutableList<ByteBuffer> createTrafBoxes(
-      List<ProcessedTrackInfo> trackInfos, long moofBoxStartPosition) {
+      List<ProcessedTrackInfo> trackInfos) {
     ImmutableList.Builder<ByteBuffer> trafBoxes = new ImmutableList.Builder<>();
     int moofBoxSize = calculateMoofBoxSize(trackInfos);
     int mdatBoxHeaderSize = BOX_HEADER_SIZE;
@@ -277,11 +275,18 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
     return moofBoxHeaderSize + mfhdBoxSize + trafBoxesSize;
   }
 
-  private void createHeader() throws IOException {
-    outputChannel.write(Boxes.ftyp());
-    outputChannel.write(
-        Boxes.moov(
-            tracks, metadataCollector, /* isFragmentedMp4= */ true, lastSampleDurationBehavior));
+
+  private ByteBuffer combine(ByteBuffer a, ByteBuffer b) {
+    return ByteBuffer.allocate(a.remaining() + b.remaining())
+        .put(a)
+        .put(b);
+  }
+  private void createHeader() {
+
+    ByteBuffer ftyp = Boxes.ftyp();
+    ByteBuffer moov = Boxes.moov(
+        tracks, metadataCollector, /* isFragmentedMp4= */ true, lastSampleDurationBehavior);
+    segmentConsumer.accept(new ProcessedSegment(true, -1, -1, combine(ftyp, moov)));
   }
 
   private boolean shouldFlushPendingSamples(Track track, BufferInfo nextSampleBufferInfo) {
@@ -319,19 +324,19 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
      */
     ImmutableList<ProcessedTrackInfo> trackInfos = processAllTracks();
     ImmutableList<ByteBuffer> trafBoxes =
-        createTrafBoxes(trackInfos, /* moofBoxStartPosition= */ outputStream.getPosition());
+        createTrafBoxes(trackInfos);
     if (trafBoxes.isEmpty()) {
       return;
     }
-    outputChannel.write(Boxes.moof(Boxes.mfhd(currentFragmentSequenceNumber), trafBoxes));
+    ByteBuffer moof = Boxes.moof(Boxes.mfhd(currentFragmentSequenceNumber), trafBoxes);
+    ByteBuffer mdat = getMdatBox(trackInfos);
 
-    writeMdatBox(trackInfos);
-
+    segmentConsumer.accept(new ProcessedSegment(false, currentFragmentSequenceNumber, maxTrackDurationUs / 1_000, combine(moof, mdat)));
     currentFragmentSequenceNumber++;
     maxTrackDurationUs = 0;
   }
 
-  private void writeMdatBox(List<ProcessedTrackInfo> trackInfos) throws IOException {
+  private ByteBuffer getMdatBox(List<ProcessedTrackInfo> trackInfos) throws IOException {
     long totalNumBytesSamples = 0;
     for (int trackInfoIndex = 0; trackInfoIndex < trackInfos.size(); trackInfoIndex++) {
       ProcessedTrackInfo currentTrackInfo = trackInfos.get(trackInfoIndex);
@@ -353,17 +358,31 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
     header.putInt((int) totalMdatSize);
     header.put(Util.getUtf8Bytes("mdat"));
     header.flip();
-    outputChannel.write(header);
 
+    int outputBufferSize = header.remaining();
     for (int trackInfoIndex = 0; trackInfoIndex < trackInfos.size(); trackInfoIndex++) {
       ProcessedTrackInfo currentTrackInfo = trackInfos.get(trackInfoIndex);
       for (int sampleIndex = 0;
           sampleIndex < currentTrackInfo.pendingSamplesByteBuffer.size();
           sampleIndex++) {
-        outputChannel.write(currentTrackInfo.pendingSamplesByteBuffer.get(sampleIndex));
+        outputBufferSize += currentTrackInfo.pendingSamplesByteBuffer.get(sampleIndex).remaining();
       }
     }
+
+    ByteBuffer outputBuffer = ByteBuffer.allocate(outputBufferSize);
+    outputBuffer.put(header);
+    for (int trackInfoIndex = 0; trackInfoIndex < trackInfos.size(); trackInfoIndex++) {
+      ProcessedTrackInfo currentTrackInfo = trackInfos.get(trackInfoIndex);
+      for (int sampleIndex = 0;
+          sampleIndex < currentTrackInfo.pendingSamplesByteBuffer.size();
+          sampleIndex++) {
+          outputBuffer.put(currentTrackInfo.pendingSamplesByteBuffer.get(sampleIndex));
+      }
+    }
+
     linearByteBufferAllocator.reset();
+    outputBuffer.flip();
+    return outputBuffer;
   }
 
   private ImmutableList<ProcessedTrackInfo> processAllTracks() {
