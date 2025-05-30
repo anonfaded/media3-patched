@@ -308,6 +308,21 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
     }
   }
 
+  /**
+   * Calculate the tracks duration including last frame duration.
+   *
+   * @param processedTrackInfos - ProcessedTrackInfos for this segment includes the first samples timestamp
+   * @param tracks - After tracks been processed tracks should include all samples that will be written in this segment.
+   * @return The duration in micro seconds.
+   */
+  private long getMaxTrackDurationUs(List<ProcessedTrackInfo> processedTrackInfos, List<Track> tracks) {
+    long maxDuration = 0;
+
+    for (int i = 0 ; i < processedTrackInfos.size() ; i++) {
+      maxDuration = max(maxDuration, ((getTrackDuration(tracks.get(i)) - processedTrackInfos.get(i).fragmentPts) * 1_000_000)/tracks.get(i).videoUnitTimebase());
+    }
+    return maxDuration;
+  }
   private void createFragment() throws IOException {
     /* Each fragment looks like:
     moof
@@ -331,7 +346,7 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
     ByteBuffer moof = Boxes.moof(Boxes.mfhd(currentFragmentSequenceNumber), trafBoxes);
     ByteBuffer mdat = getMdatBox(trackInfos);
 
-    segmentConsumer.accept(new ProcessedSegment(false, currentFragmentSequenceNumber, maxTrackDurationUs / 1_000, combine(moof, mdat)));
+    segmentConsumer.accept(new ProcessedSegment(false, currentFragmentSequenceNumber, getMaxTrackDurationUs(trackInfos, tracks) / 1_000, combine(moof, mdat)));
     currentFragmentSequenceNumber++;
     maxTrackDurationUs = 0;
   }
