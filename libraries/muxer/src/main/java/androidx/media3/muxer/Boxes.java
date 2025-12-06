@@ -76,7 +76,10 @@ import org.checkerframework.checker.nullness.qual.PolyNull;
   public static final int MFHD_BOX_CONTENT_SIZE = 2 * BYTES_PER_INTEGER;
 
   /** The size (in bytes) of the tfhd box content. */
-  public static final int TFHD_BOX_CONTENT_SIZE = 4 * BYTES_PER_INTEGER;
+  public static final int TFHD_BOX_CONTENT_SIZE = 2 * BYTES_PER_INTEGER;
+
+  /** The size (in bytes) of the tfdt box content. */
+  public static final int TFDT_BOX_CONTENT_SIZE = 3 * BYTES_PER_INTEGER;
 
   /** The maximum size (in bytes) of boxes that have fixed sizes. */
   private static final int MAX_FIXED_LEAF_BOX_SIZE = 200;
@@ -1233,20 +1236,31 @@ import org.checkerframework.checker.nullness.qual.PolyNull;
   }
 
   /** Returns a track fragment (traf) box. */
-  public static ByteBuffer traf(ByteBuffer tfhdBox, ByteBuffer trunBox) {
-    return BoxUtils.wrapBoxesIntoBox("traf", ImmutableList.of(tfhdBox, trunBox));
+  public static ByteBuffer traf(ByteBuffer tfhdBox, ByteBuffer tfdtBox, ByteBuffer trunBox) {
+    return BoxUtils.wrapBoxesIntoBox("traf", ImmutableList.of(tfhdBox, tfdtBox, trunBox));
   }
 
   /** Returns a track fragment header (tfhd) box. */
-  public static ByteBuffer tfhd(int trackId, long baseDataOffset) {
+  public static ByteBuffer tfhd(int trackId) {
     ByteBuffer contents = ByteBuffer.allocate(TFHD_BOX_CONTENT_SIZE);
     // 0x000001 base-data-offset-present: indicates the presence of the base-data-offset field.
-    contents.putInt(0x0 | 0x000001); // version and flags
+    // This is incompatible with MSE, so we clear this bit.
+    contents.putInt(0x0 | 0x000000); // version and flags
     contents.putInt(trackId);
-    contents.putLong(baseDataOffset);
     contents.flip();
     return BoxUtils.wrapIntoBox("tfhd", contents);
   }
+
+  /** Returns a track fragment header (tfdt) box. */
+  public static ByteBuffer tfdt(long firstPts) {
+    ByteBuffer contents = ByteBuffer.allocate(TFDT_BOX_CONTENT_SIZE);
+    // 0x01000000 Version 1, specify that the timestamp is 64byte (Long) value.
+    contents.putInt(0x0 | 0x01000000); // version and flags
+    contents.putLong((firstPts));
+    contents.flip();
+    return BoxUtils.wrapIntoBox("tfdt", contents);
+  }
+
 
   /** Returns a track fragment run (trun) box. */
   public static ByteBuffer trun(
