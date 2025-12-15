@@ -220,7 +220,9 @@ import org.checkerframework.checker.nullness.qual.PolyNull;
           mhdBox = smhd();
           sampleEntryBox = audioSampleEntry(format);
           stsdBox = stsd(sampleEntryBox);
-          stblBox = stbl(stsdBox, stts, stsz, stsc, chunkOffsetBox);
+          // VLC FIX: Add stss (sync sample table) for audio to enable VLC playback
+          // AAC frames are all independently decodable, so mark all as keyframes
+          stblBox = stbl(stsdBox, stts, stsz, stsc, chunkOffsetBox, stss(track.writtenSamples));
           break;
         case C.TRACK_TYPE_METADATA:
         case C.TRACK_TYPE_UNKNOWN:
@@ -1245,7 +1247,9 @@ import org.checkerframework.checker.nullness.qual.PolyNull;
     ByteBuffer contents = ByteBuffer.allocate(TFHD_BOX_CONTENT_SIZE);
     // 0x000001 base-data-offset-present: indicates the presence of the base-data-offset field.
     // This is incompatible with MSE, so we clear this bit.
-    contents.putInt(0x0 | 0x000000); // version and flags
+    // VLC FIX: Set default-base-is-moof (0x020000) to ensure trun data_offset is relative to moof
+    // Using Version 0 (top byte 0x00) and Flags 0x020000
+    contents.putInt(0x00020000); // 0x020000 = default-base-is-moof
     contents.putInt(trackId);
     contents.flip();
     return BoxUtils.wrapIntoBox("tfhd", contents);
