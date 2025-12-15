@@ -203,17 +203,14 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
       createFragment();
     }
     track.writeSampleData(byteBuffer, bufferInfo);
-    BufferInfo firstPendingSample = track.pendingSamplesBufferInfo.peekFirst();
-    BufferInfo lastPendingSample = track.pendingSamplesBufferInfo.peekLast();
-    // Null check added: queue might be empty in rare race conditions during flushing
-    if (firstPendingSample != null && lastPendingSample != null) {
-      minInputPresentationTimeUs =
-          min(minInputPresentationTimeUs, firstPendingSample.presentationTimeUs);
-      maxTrackDurationUs =
-          max(
-              maxTrackDurationUs,
-              lastPendingSample.presentationTimeUs - firstPendingSample.presentationTimeUs);
-    }
+    BufferInfo firstPendingSample = checkNotNull(track.pendingSamplesBufferInfo.peekFirst());
+    BufferInfo lastPendingSample = checkNotNull(track.pendingSamplesBufferInfo.peekLast());
+    minInputPresentationTimeUs =
+        min(minInputPresentationTimeUs, firstPendingSample.presentationTimeUs);
+    maxTrackDurationUs =
+        max(
+            maxTrackDurationUs,
+            lastPendingSample.presentationTimeUs - firstPendingSample.presentationTimeUs);
   }
 
   public void close() throws IOException {
@@ -300,24 +297,10 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
       if (track.equals(videoTrack)
           && track.hadKeyframe
           && ((nextSampleBufferInfo.flags & C.BUFFER_FLAG_KEY_FRAME) > 0)) {
-        BufferInfo firstPendingSample = track.pendingSamplesBufferInfo.peekFirst();
-        BufferInfo lastPendingSample = track.pendingSamplesBufferInfo.peekLast();
-        if (firstPendingSample != null && lastPendingSample != null) {
-          return lastPendingSample.presentationTimeUs - firstPendingSample.presentationTimeUs
-              >= fragmentDurationUs;
-        }
-      }
-
-      // Allow audio to flush independently if its duration >= fragmentDurationUs
-      // This prevents audio samples from being dropped when they haven't caught up with video keyframes
-      if (!track.equals(videoTrack) && !track.pendingSamplesBufferInfo.isEmpty()) {
-        BufferInfo firstPendingSample = track.pendingSamplesBufferInfo.peekFirst();
-        BufferInfo lastPendingSample = track.pendingSamplesBufferInfo.peekLast();
-        // Safety check: ensure we actually got valid samples before calculating duration
-        if (firstPendingSample != null && lastPendingSample != null) {
-          return lastPendingSample.presentationTimeUs - firstPendingSample.presentationTimeUs
-              >= fragmentDurationUs;
-        }
+        BufferInfo firstPendingSample = checkNotNull(track.pendingSamplesBufferInfo.peekFirst());
+        BufferInfo lastPendingSample = checkNotNull(track.pendingSamplesBufferInfo.peekLast());
+        return lastPendingSample.presentationTimeUs - firstPendingSample.presentationTimeUs
+            >= fragmentDurationUs;
       }
       return false;
     } else {
