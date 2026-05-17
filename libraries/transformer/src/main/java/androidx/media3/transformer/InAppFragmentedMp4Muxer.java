@@ -28,10 +28,13 @@ import androidx.media3.muxer.FragmentedMp4Muxer;
 import androidx.media3.muxer.Muxer;
 import androidx.media3.muxer.MuxerException;
 import androidx.media3.muxer.MuxerUtil;
+import androidx.media3.muxer.ProcessedSegment;
+import androidx.media3.common.util.Consumer;
 import com.google.common.collect.ImmutableList;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.Locale;
 
@@ -90,7 +93,19 @@ public final class InAppFragmentedMp4Muxer implements Muxer {
         throw new MuxerException("Error creating file output stream", e);
       }
 
-      FragmentedMp4Muxer.Builder builder = new FragmentedMp4Muxer.Builder(outputStream);
+      // The patched FragmentedMp4Muxer.Builder requires a Consumer<ProcessedSegment> callback.
+      // For InAppFragmentedMp4Muxer (used by Transformer for export), we just write each
+      // segment's payload directly to the file output stream.
+      FragmentedMp4Muxer.Builder builder = new FragmentedMp4Muxer.Builder(segment -> {
+          try {
+              ByteBuffer buffer = segment.payload;
+              byte[] data = new byte[buffer.remaining()];
+              buffer.get(data);
+              outputStream.write(data);
+          } catch (IOException e) {
+              throw new RuntimeException(e);
+          }
+      });
       if (fragmentDurationMs != C.TIME_UNSET) {
         builder.setFragmentDurationMs(fragmentDurationMs);
       }
