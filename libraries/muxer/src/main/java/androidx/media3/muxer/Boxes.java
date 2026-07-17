@@ -194,8 +194,14 @@ import org.checkerframework.checker.nullness.qual.PolyNull;
               : ByteBuffer.allocate(0);
       ByteBuffer stsz = stsz(track.writtenSamples);
       ByteBuffer stsc = stsc(track.writtenChunkSampleCounts);
-      ByteBuffer chunkOffsetBox =
-          isFragmentedMp4 ? stco(track.writtenChunkOffsets) : co64(track.writtenChunkOffsets);
+      // Use 32-bit stco when offsets fit; co64 only when necessary.
+      // stco has broader app compatibility (WhatsApp, Instagram, older players).
+      ByteBuffer chunkOffsetBox;
+      if (isFragmentedMp4 || allOffsetsWithin32Bit(track.writtenChunkOffsets)) {
+        chunkOffsetBox = stco(track.writtenChunkOffsets);
+      } else {
+        chunkOffsetBox = co64(track.writtenChunkOffsets);
+      }
 
       String handlerType;
       String handlerName;
@@ -2041,6 +2047,13 @@ import org.checkerframework.checker.nullness.qual.PolyNull;
       }
     }
     return minInputPtsUs != Long.MAX_VALUE ? minInputPtsUs : C.TIME_UNSET;
+  }
+
+  private static boolean allOffsetsWithin32Bit(List<Long> offsets) {
+    for (int i = 0; i < offsets.size(); i++) {
+      if (offsets.get(i) > Integer.MAX_VALUE) return false;
+    }
+    return true;
   }
 
   /** Returns profile and level of dolby vision */
