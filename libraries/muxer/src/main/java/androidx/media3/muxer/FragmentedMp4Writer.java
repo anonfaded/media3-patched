@@ -42,6 +42,8 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
 import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
 
 /**
@@ -118,6 +120,36 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
   private final List<Track> tracks;
   private final LinearByteBufferAllocator linearByteBufferAllocator;
 
+  /** Dedicated writer thread that calls segmentConsumer.accept() asynchronously.
+   *  This decouples disk/network I/O from the encoder drain thread, eliminating
+   *  the periodic ~2-3s stutter caused by fragment finalization + fsync blocking
+   *  the encoder pipeline.
+   *
+   *  The queue holds either ProcessedSegment (for header) or MdatBuildTask
+   *  (for media fragments, so moof/mdat box construction happens off the
+   *  drain thread). */
+  private final BlockingQueue<Object> segmentQueue;
+  private final Thread writerThread;
+  private volatile IOException writerError;
+
+  /** Poison pill — signals the writer thread to exit after draining the queue. */
+  private static final Object WRITER_POISON = new Object();
+
+  /** Task for async moof+mdat box construction on the writer thread.
+   *  Track processing (processAllTracks) runs on the drain thread.
+   *  Box building (createTrafBoxes, getMdatBox, combine) runs on the writer thread. */
+  private static final class MdatBuildTask {
+    final ImmutableList<ProcessedTrackInfo> trackInfos;
+    final int fragmentNumber;
+    final long maxDurationUs;
+
+    MdatBuildTask(ImmutableList<ProcessedTrackInfo> trackInfos, int fragmentNumber, long maxDurationUs) {
+      this.trackInfos = trackInfos;
+      this.fragmentNumber = fragmentNumber;
+      this.maxDurationUs = maxDurationUs;
+    }
+  }
+
   private @MonotonicNonNull Track videoTrack;
   private int currentFragmentSequenceNumber;
   private boolean headerCreated;
@@ -149,12 +181,50 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
     this.annexBToAvccConverter = annexBToAvccConverter;
     this.fragmentDurationUs = fragmentDurationMs * 1_000;
     this.sampleCopyEnabled = sampleCopyEnabled;
+    this.segmentQueue = new LinkedBlockingQueue<>(4);
+    this.writerError = null;
     lastSampleDurationBehavior =
         LAST_SAMPLE_DURATION_BEHAVIOR_SET_FROM_END_OF_STREAM_BUFFER_OR_DUPLICATE_PREVIOUS;
     tracks = new ArrayList<>();
     minInputPresentationTimeUs = Long.MAX_VALUE;
     currentFragmentSequenceNumber = 1;
     linearByteBufferAllocator = new LinearByteBufferAllocator(/* initialCapacity= */ 0);
+
+    // Start the dedicated writer thread that processes segments asynchronously.
+    // This prevents disk/network I/O from blocking the encoder drain thread.
+    writerThread = new Thread(() -> {
+      while (true) {
+        try {
+          Object item = segmentQueue.take();
+          if (item == WRITER_POISON) {
+            break;
+          }
+          if (item instanceof ProcessedSegment) {
+            segmentConsumer.accept((ProcessedSegment) item);
+          } else if (item instanceof MdatBuildTask) {
+            MdatBuildTask task = (MdatBuildTask) item;
+            // Build and write the fragment.  If ANY step fails, store the
+            // error and stop producing segments — do NOT write partial data
+            // which would corrupt the file and cause seek loops.
+            ImmutableList<ByteBuffer> trafBoxes = createTrafBoxes(task.trackInfos);
+            ByteBuffer moof = Boxes.moof(Boxes.mfhd(task.fragmentNumber), trafBoxes);
+            ByteBuffer mdat = getMdatBox(task.trackInfos);
+            ProcessedSegment seg = new ProcessedSegment(false, task.fragmentNumber,
+                task.maxDurationUs / 1_000, combine(moof, mdat));
+            segmentConsumer.accept(seg);
+          }
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          break;
+        } catch (Exception e) {
+          writerError = new IOException("Writer thread error: " + e.getMessage(), e);
+          break; // STOP — further processing would produce corrupted fragments
+        }
+      }
+      // Drain remaining items so writing threads don't block forever
+      segmentQueue.drainTo(new java.util.ArrayList<>());
+    }, "FragmentedMp4Writer-SegmentWriter");
+    writerThread.start();
   }
 
   public Track addTrack(int sortKey, Format format) {
@@ -190,6 +260,10 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
   }
   public void writeSampleData(Track track, ByteBuffer byteBuffer, BufferInfo bufferInfo)
       throws IOException {
+    // Fast-fail if the writer thread has already errored.
+    if (writerError != null) {
+      throw new IOException("Segment writer thread previously failed", writerError);
+    }
     if (Objects.equals(track.format.sampleMimeType, MimeTypes.VIDEO_AV1)
         && track.format.initializationData.isEmpty()
         && track.parsedCsd == null) {
@@ -217,9 +291,26 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
   }
 
   public void close() throws IOException {
+    // Flush any remaining buffered samples as a final fragment, then
+    // signal the writer thread to exit and wait for it to finish all
+    // pending I/O before this method returns.
     try {
       createFragment();
     } finally {
+      // Always shut down the writer thread, even if createFragment() threw.
+      try {
+        segmentQueue.put(WRITER_POISON);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+      }
+      try {
+        writerThread.join();
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+      }
+    }
+    if (writerError != null) {
+      throw new IOException("Segment writer thread failed", writerError);
     }
   }
 
@@ -284,12 +375,18 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
         .put(a)
         .put(b);
   }
-  private void createHeader() {
+  private void createHeader() throws IOException {
 
     ByteBuffer ftyp = Boxes.ftyp();
     ByteBuffer moov = Boxes.moov(
         tracks, metadataCollector, /* isFragmentedMp4= */ true, lastSampleDurationBehavior);
-    segmentConsumer.accept(new ProcessedSegment(true, -1, -1, combine(ftyp, moov)));
+    ProcessedSegment segment = new ProcessedSegment(true, -1, -1, combine(ftyp, moov));
+    try {
+      segmentQueue.put(segment);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new IOException("Interrupted while enqueueing init segment", e);
+    }
   }
 
   private boolean shouldFlushPendingSamples(Track track, BufferInfo nextSampleBufferInfo) {
@@ -341,31 +438,29 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
     return maxDuration;
   }
   private void createFragment() throws IOException {
-    /* Each fragment looks like:
-    moof
-        mfhd
-        traf
-           tfhd
-           tfdt
-           trun
-        traf
-           tfhd
-           tfdt
-           trun
-     mdat
-     */
+    /* Phase 1 (drain thread): Process tracks — fast metadata work only.
+       Phase 2 (writer thread): Build moof+mdat boxes + consumer call — async. */
+
     ImmutableList<ProcessedTrackInfo> trackInfos = processAllTracks();
-    ImmutableList<ByteBuffer> trafBoxes =
-        createTrafBoxes(trackInfos);
-    if (trafBoxes.isEmpty()) {
+    // Reset allocator after track processing to prevent unbounded growth.
+    // All AnnexB→AVCC conversions are done; the allocator's buffers can be freed.
+    // Must run on the drain thread (same thread as processTrack's allocations).
+    linearByteBufferAllocator.reset();
+    if (trackInfos.isEmpty()) {
       return;
     }
-    ByteBuffer moof = Boxes.moof(Boxes.mfhd(currentFragmentSequenceNumber), trafBoxes);
-    ByteBuffer mdat = getMdatBox(trackInfos);
 
-    segmentConsumer.accept(new ProcessedSegment(false, currentFragmentSequenceNumber, getMaxTrackDurationUs(trackInfos, tracks) / 1_000, combine(moof, mdat)));
+    int fragNum = currentFragmentSequenceNumber;
     currentFragmentSequenceNumber++;
+    long fragMaxDurationUs = getMaxTrackDurationUs(trackInfos, tracks);
     maxTrackDurationUs = 0;
+
+    try {
+      segmentQueue.put(new MdatBuildTask(trackInfos, fragNum, fragMaxDurationUs));
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new IOException("Interrupted while enqueueing fragment build task", e);
+    }
   }
 
   private ByteBuffer getMdatBox(List<ProcessedTrackInfo> trackInfos) throws IOException {
@@ -412,7 +507,9 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
       }
     }
 
-    linearByteBufferAllocator.reset();
+    // NOTE: linearByteBufferAllocator.reset() was here but removed — it now
+    // runs on the writer thread, while processTrack() (which allocates from it)
+    // runs on the drain thread.  Resetting concurrently would be a data race.
     outputBuffer.flip();
     return outputBuffer;
   }
