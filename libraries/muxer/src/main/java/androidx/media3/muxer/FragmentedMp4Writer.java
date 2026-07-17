@@ -290,6 +290,34 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
     }
   }
 
+  /**
+   * Builds a complete non-fragmented MP4 moov box from all accumulated
+   * sample data, to be appended at the end of the file for Hybrid MP4
+   * finalization.  The caller is responsible for appending this moov
+   * and overwriting the free placeholder with an mdat header.
+   */
+  public ByteBuffer buildFinalMoov(
+      List<Long> audioOffsets, List<Integer> audioCounts,
+      List<Long> videoOffsets, List<Integer> videoCounts) {
+
+    // Populate per-track chunk metadata from the arguments.
+    for (int i = 0; i < tracks.size(); i++) {
+      Track t = tracks.get(i);
+      boolean isAudio = !MimeTypes.isVideo(t.format.sampleMimeType);
+      List<Long> offsets = isAudio ? audioOffsets : videoOffsets;
+      List<Integer> counts = isAudio ? audioCounts : videoCounts;
+      if (offsets != null && counts != null) {
+        t.writtenChunkOffsets.clear();
+        t.writtenChunkOffsets.addAll(offsets);
+        t.writtenChunkSampleCounts.clear();
+        t.writtenChunkSampleCounts.addAll(counts);
+      }
+    }
+
+    return Boxes.moov(tracks, metadataCollector, /* isFragmentedMp4= */ false,
+        lastSampleDurationBehavior);
+  }
+
   public void close() throws IOException {
     // Flush any remaining buffered samples as a final fragment, then
     // signal the writer thread to exit and wait for it to finish all
@@ -371,16 +399,29 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
 
 
   private ByteBuffer combine(ByteBuffer a, ByteBuffer b) {
-    return ByteBuffer.allocate(a.remaining() + b.remaining())
+    return (ByteBuffer) ByteBuffer.allocate(a.remaining() + b.remaining())
         .put(a)
-        .put(b);
+        .put(b)
+        .flip();
   }
   private void createHeader() throws IOException {
 
     ByteBuffer ftyp = Boxes.ftyp();
+    // Hybrid MP4: insert a 16-byte free box between ftyp and moov.
+    // On clean stop this placeholder is overwritten with an mdat header
+    // that turns the entire file body into one Media Data box, making
+    // the fragmented file appear as a standard MP4.  On crash, the
+    // free box is harmless — the file remains a valid fMP4.
+    ByteBuffer freePlaceholder = ByteBuffer.allocate(16);
+    freePlaceholder.putInt(16);                          // box size = 16
+    freePlaceholder.put(new byte[]{'f','r','e','e'});    // type = 'free'
+    freePlaceholder.putLong(0);                          // padding; becomes mdat extended size
+    freePlaceholder.flip();
+
     ByteBuffer moov = Boxes.moov(
         tracks, metadataCollector, /* isFragmentedMp4= */ true, lastSampleDurationBehavior);
-    ProcessedSegment segment = new ProcessedSegment(true, -1, -1, combine(ftyp, moov));
+    ProcessedSegment segment = new ProcessedSegment(true, -1, -1,
+        combine(combine(ftyp, freePlaceholder), moov));
     try {
       segmentQueue.put(segment);
     } catch (InterruptedException e) {

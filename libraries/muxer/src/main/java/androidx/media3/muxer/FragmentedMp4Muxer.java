@@ -34,6 +34,7 @@ import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
+import java.util.List;
 
 /**
  * A muxer for creating a fragmented MP4 file.
@@ -249,6 +250,18 @@ public final class FragmentedMp4Muxer implements Muxer {
   public void addMetadataEntry(Metadata.Entry metadataEntry) {
     checkArgument(MuxerUtil.isMetadataSupported(metadataEntry), "Unsupported metadata");
     metadataCollector.addMetadata(metadataEntry);
+  }
+
+  /**
+   * Builds the final standard-MP4 moov box for OBS-style Hybrid MP4
+   * finalization.  Call after {@link #close()} — all sample data must be
+   * fully written.
+   */
+  public ByteBuffer buildFinalMoov(
+      List<Long> audioOffsets, List<Integer> audioCounts,
+      List<Long> videoOffsets, List<Integer> videoCounts) {
+    return fragmentedMp4Writer.buildFinalMoov(
+        audioOffsets, audioCounts, videoOffsets, videoCounts);
   }
 
   @Override
