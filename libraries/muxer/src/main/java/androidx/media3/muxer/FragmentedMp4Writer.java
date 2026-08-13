@@ -125,9 +125,9 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
    *  the periodic ~2-3s stutter caused by fragment finalization + fsync blocking
    *  the encoder pipeline.
    *
-   *  The queue holds either ProcessedSegment (for header) or MdatBuildTask
-   *  (for media fragments, so moof/mdat box construction happens off the
-   *  drain thread). */
+   *  The queue holds ProcessedSegment (init header + final combined media
+   *  fragments). Box construction happens on the drain thread — the writer
+   *  thread only performs the final segment I/O. */
   private final BlockingQueue<Object> segmentQueue;
   private final Thread writerThread;
   private volatile IOException writerError;
@@ -135,27 +135,14 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
   /** Poison pill — signals the writer thread to exit after draining the queue. */
   private static final Object WRITER_POISON = new Object();
 
-  /** Task for async moof+mdat box construction on the writer thread.
-   *  Track processing (processAllTracks) runs on the drain thread.
-   *  Box building (createTrafBoxes, getMdatBox, combine) runs on the writer thread. */
-  private static final class MdatBuildTask {
-    final ImmutableList<ProcessedTrackInfo> trackInfos;
-    final int fragmentNumber;
-    final long maxDurationUs;
-
-    MdatBuildTask(ImmutableList<ProcessedTrackInfo> trackInfos, int fragmentNumber, long maxDurationUs) {
-      this.trackInfos = trackInfos;
-      this.fragmentNumber = fragmentNumber;
-      this.maxDurationUs = maxDurationUs;
-    }
-  }
-
   private @MonotonicNonNull Track videoTrack;
   private int currentFragmentSequenceNumber;
   private boolean headerCreated;
   private long minInputPresentationTimeUs;
   private long maxTrackDurationUs;
   private int nextTrackId;
+  /** AVC corruption tracing: bounded counter for converted-sample diagnostics. */
+  private int sampleConvertDiagCount = 0;
 
   /**
    * Creates an instance.
@@ -190,8 +177,17 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
     currentFragmentSequenceNumber = 1;
     linearByteBufferAllocator = new LinearByteBufferAllocator(/* initialCapacity= */ 0);
 
-    // Start the dedicated writer thread that processes segments asynchronously.
-    // This prevents disk/network I/O from blocking the encoder drain thread.
+    // Start the dedicated writer thread that performs the final segment I/O
+    // (segmentConsumer.accept) asynchronously. This prevents disk/network I/O
+    // from blocking the encoder drain thread.
+    //
+    // NOTE: moof/mdat BOX BUILDING deliberately stays on the drain thread
+    // (inside createFragment). The AnnexB→AVCC converter writes into the shared
+    // linearByteBufferAllocator pool; if the pool were read on this writer
+    // thread after the drain thread reset/reused it for the next fragment, the
+    // sample data would be silently corrupted (misaligned NAL length prefixes —
+    // "Invalid NAL unit size" in ffprobe). Only the FINAL combined segment
+    // buffer (an independent allocation) crosses the thread boundary.
     writerThread = new Thread(() -> {
       while (true) {
         try {
@@ -201,17 +197,6 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
           }
           if (item instanceof ProcessedSegment) {
             segmentConsumer.accept((ProcessedSegment) item);
-          } else if (item instanceof MdatBuildTask) {
-            MdatBuildTask task = (MdatBuildTask) item;
-            // Build and write the fragment.  If ANY step fails, store the
-            // error and stop producing segments — do NOT write partial data
-            // which would corrupt the file and cause seek loops.
-            ImmutableList<ByteBuffer> trafBoxes = createTrafBoxes(task.trackInfos);
-            ByteBuffer moof = Boxes.moof(Boxes.mfhd(task.fragmentNumber), trafBoxes);
-            ByteBuffer mdat = getMdatBox(task.trackInfos);
-            ProcessedSegment seg = new ProcessedSegment(false, task.fragmentNumber,
-                task.maxDurationUs / 1_000, combine(moof, mdat));
-            segmentConsumer.accept(seg);
           }
         } catch (InterruptedException e) {
           Thread.currentThread().interrupt();
@@ -479,15 +464,16 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
     return maxDuration;
   }
   private void createFragment() throws IOException {
-    /* Phase 1 (drain thread): Process tracks — fast metadata work only.
-       Phase 2 (writer thread): Build moof+mdat boxes + consumer call — async. */
+    /* All work that touches the shared linearByteBufferAllocator pool (AnnexB→AVCC
+       conversion in processAllTracks, plus the moof/mdat box building that reads the
+       converted buffers) runs HERE on the drain thread. The writer thread only
+       receives the final combined segment buffer — an independent allocation — and
+       performs the actual I/O (segmentConsumer.accept). This is what makes
+       allocator.reset() below safe: no other thread can be reading pool memory. */
 
     ImmutableList<ProcessedTrackInfo> trackInfos = processAllTracks();
-    // Reset allocator after track processing to prevent unbounded growth.
-    // All AnnexB→AVCC conversions are done; the allocator's buffers can be freed.
-    // Must run on the drain thread (same thread as processTrack's allocations).
-    linearByteBufferAllocator.reset();
     if (trackInfos.isEmpty()) {
+      linearByteBufferAllocator.reset();
       return;
     }
 
@@ -497,10 +483,21 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
     maxTrackDurationUs = 0;
 
     try {
-      segmentQueue.put(new MdatBuildTask(trackInfos, fragNum, fragMaxDurationUs));
+      // Build moof+mdat now, while the pool is exclusively ours. combine() copies
+      // everything into a fresh independent buffer before crossing threads.
+      ImmutableList<ByteBuffer> trafBoxes = createTrafBoxes(trackInfos);
+      ByteBuffer moof = Boxes.moof(Boxes.mfhd(fragNum), trafBoxes);
+      ByteBuffer mdat = getMdatBox(trackInfos);
+      ProcessedSegment seg = new ProcessedSegment(false, fragNum,
+          fragMaxDurationUs / 1_000, combine(moof, mdat));
+      segmentQueue.put(seg);
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
-      throw new IOException("Interrupted while enqueueing fragment build task", e);
+      throw new IOException("Interrupted while enqueueing fragment segment", e);
+    } finally {
+      // Safe: the combined segment buffer is independent of the pool, and the
+      // writer thread never reads pool memory.
+      linearByteBufferAllocator.reset();
     }
   }
 
@@ -580,6 +577,21 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
         ByteBuffer currentSampleByteBuffer = track.pendingSamplesByteBuffer.removeFirst();
         currentSampleByteBuffer =
             annexBToAvccConverter.process(currentSampleByteBuffer, linearByteBufferAllocator);
+        // AVC corruption tracing (first 2 converted video samples only):
+        // valid AVCC starts with a 4-byte NAL length, e.g. 00 00 00 16 67...
+        if (sampleConvertDiagCount < 2 && MimeTypes.isVideo(track.format.sampleMimeType)) {
+          sampleConvertDiagCount++;
+          StringBuilder hex = new StringBuilder();
+          int shown = Math.min(16, currentSampleByteBuffer.remaining());
+          for (int i = 0; i < shown; i++) {
+            hex.append(String.format("%02X ", currentSampleByteBuffer.get(currentSampleByteBuffer.position() + i)));
+          }
+          android.util.Log.i(
+              "FragmentedMp4Writer",
+              "[AVC-DIAG] converted video sample #" + sampleConvertDiagCount
+                  + " size=" + currentSampleByteBuffer.remaining()
+                  + " head=" + hex.toString().trim());
+        }
         pendingSamplesByteBuffer.add(currentSampleByteBuffer);
         BufferInfo currentSampleBufferInfo = track.pendingSamplesBufferInfo.removeFirst();
         currentSampleBufferInfo =
