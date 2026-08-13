@@ -228,6 +228,33 @@ public final class FragmentedMp4Muxer implements Muxer {
   }
 
   /**
+   * Finalizes an abandoned fragmented MP4 in place — a recording whose process died
+   * mid-session (aggressive OEM background management) is left as a valid fMP4 but never
+   * receives the hybrid moov, so consumer apps can't play it. This rebuilds the moov
+   * purely from the file's contents (init segment + moof sample tables) and appends it.
+   *
+   * <p>The file is only modified when conversion can be completed safely: an empty moov
+   * or an unverified free placeholder aborts without writing anything.
+   *
+   * @param channel An open, positionable channel to the file ("rw").
+   * @return 1 if converted, 0 if it was not a fragmented MP4 (already hybrid/plain),
+   *     -1 if fragmented but conversion failed (file untouched).
+   */
+  public static int finalizeAbandonedFile(java.nio.channels.FileChannel channel) {
+    return AbandonedFileFinalizer.finalize(channel);
+  }
+
+  /**
+   * Two-channel variant for SAF file descriptors: pass a readable channel
+   * (FileInputStream(fd).getChannel()) and a writable channel
+   * (FileOutputStream(fd).getChannel()) wrapping the SAME fd.
+   */
+  public static int finalizeAbandonedFile(java.nio.channels.FileChannel readChannel,
+      java.nio.channels.FileChannel writeChannel) {
+    return AbandonedFileFinalizer.finalize(readChannel, writeChannel);
+  }
+
+  /**
    * {@inheritDoc}
    *
    * <p>List of supported {@linkplain Metadata.Entry metadata entries}:
