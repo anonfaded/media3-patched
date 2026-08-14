@@ -63,6 +63,7 @@ import java.util.List;
     byte[] csd0;
     byte[] csd1;
     int sampleRate = 48_000;
+    int mdhdTimescale = -1; // parsed mdhd timescale, only when plausibly valid
     int channelCount = 2;
     // Per-fragment sample metadata (indexed like moofPositions).
     final List<Integer> fragmentSampleCounts = new ArrayList<>();
@@ -107,6 +108,17 @@ import java.util.List;
 
       List<TrackInfo> tracks = parseMoov(info.initSegment);
       if (tracks.isEmpty()) return -1;
+      // The per-track timescale determines how trun sample durations map to
+      // microseconds. Use the parsed mdhd timescale when valid, otherwise the
+      // track-type default (video 90000, audio 48000) — a bogus divisor here
+      // is what produced slow-motion repaired files.
+      for (TrackInfo t : tracks) {
+        if (t.mdhdTimescale > 0) {
+          t.sampleRate = t.mdhdTimescale;
+        } else {
+          t.sampleRate = t.isVideo ? 90_000 : 48_000;
+        }
+      }
 
       byte[] firstVideoSample = parseMoofs(readChannel, info, tracks);
       if (firstVideoSample == null) return -1;
@@ -162,14 +174,23 @@ import java.util.List;
       }
 
       // Patch mvhd.duration (offset = ftypSize + 8 + 24, timescale 10000).
-      long lastPtsUs = 0;
+      // Prefer the VIDEO track's total — matches the live hybrid finalize,
+      // which patches mvhd.duration from the video end-pts. Falling back to
+      // the audio total would overstate the duration (audio pre-roll + longer
+      // tail), stretching playback.
+      long videoLast = -1;
+      long maxLast = 0;
       for (TrackInfo t : tracks) {
         long trackLast = 0;
         for (int i = 0; i < t.sampleDurationsUs.size(); i++) {
           trackLast += t.sampleDurationsUs.get(i);
         }
-        lastPtsUs = Math.max(lastPtsUs, trackLast);
+        maxLast = Math.max(maxLast, trackLast);
+        if (t.isVideo) {
+          videoLast = trackLast;
+        }
       }
+      long lastPtsUs = videoLast >= 0 ? videoLast : maxLast;
       int durationVu = (int) (lastPtsUs * 10_000L / 1_000_000L);
       ByteBuffer patch = ByteBuffer.allocate(4);
       patch.putInt(durationVu);
@@ -295,9 +316,19 @@ import java.util.List;
       } else if (type == 0x6D646864) { // 'mdhd'
         int verFlags = readIntBE(b, pos + 8);
         int version = verFlags >> 24;
-        int rateOffset = pos + 12 + (version == 1 ? 20 : 12);
-        int timescale = readIntBE(b, rateOffset);
-        if (timescale > 0) t.sampleRate = timescale;
+        // mdhd layout (fullbox): [ver/flags(4)][creation][modification][timescale][duration]
+        //   v0: creation(4) modification(4) timescale(4) duration(4)
+        //   v1: creation(8) modification(8) timescale(4) duration(8)
+        // timescale sits at pos+20 (v0) / pos+28 (v1) — reading the DURATION
+        // field as the timescale made the reconstructed duration wildly wrong
+        // (slow-motion playback), so keep a sanity range and only accept a
+        // plausible value; the per-track default is applied after the full
+        // parse (track type may not be known yet here).
+        int timescaleOffset = pos + 12 + (version == 1 ? 16 : 8);
+        int timescale = readIntBE(b, timescaleOffset);
+        if (timescale > 0 && timescale <= 1_000_000) {
+          t.mdhdTimescale = timescale;
+        }
       } else if (type == 0x6D696E66) { // 'minf'
         parseStbl(b, pos, size, t);
       }
