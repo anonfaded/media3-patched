@@ -57,6 +57,7 @@ import java.util.List;
     int trackId;
     boolean isVideo;
     boolean isAudio;
+    boolean isHevc;
     int width;
     int height;
     byte[] csd0;
@@ -338,8 +339,12 @@ import java.util.List;
       int size = readIntBE(b, pos);
       int type = readIntBE(b, pos + 4);
       if (size < 8 || pos + size > end) break;
-      if (type == 0x61766331 || type == 0x68766331) { // 'avc1' / 'hvc1'
+      if (type == 0x61766331) { // 'avc1'
         parseAvcC(b, pos, size, t);
+        break;
+      } else if (type == 0x68766331) { // 'hvc1'
+        t.isHevc = true;
+        parseHvcC(b, pos, size, t);
         break;
       } else if (type == 0x6D703461) { // 'mp4a'
         t.channelCount = (b[pos + 24] & 0xFF) << 8 | (b[pos + 25] & 0xFF);
@@ -396,6 +401,48 @@ import java.util.List;
       }
     } catch (Exception e) {
       android.util.Log.w(TAG, "Failed to parse avcC", e);
+    }
+  }
+
+  /**
+   * Parses the hvcC box (HEVC) inside the stsd sample entry and packs the
+   * VPS/SPS/PPS arrays into the single Annex-B csd-0 that media3's hvcCBox
+   * expects (all three NAL units concatenated with start codes).
+   */
+  private static void parseHvcC(byte[] b, int entryStart, int entrySize, TrackInfo t) {
+    try {
+      int entryEnd = entryStart + entrySize;
+      int hvcCPos = findChildBox(b, entryStart + 86, entryEnd, 0x68766343); // 'hvcC'
+      if (hvcCPos < 0) {
+        hvcCPos = findChildBox(b, entryStart + 8, entryEnd, 0x68766343);
+      }
+      if (hvcCPos < 0) return;
+
+      int p = hvcCPos + 8;
+      // hvcC: configVersion(1) + profile(1) + compat(4) + constraint(6) +
+      // level(1) + reserved(2) + parallelism(1) + chroma(1) + bitdepth(2) +
+      // avgFrameRate(2) + constantFrameRate(1) = 22 bytes, then numOfArrays(1).
+      int numArrays = b[p + 22] & 0xFF;
+      int q = p + 23;
+      java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+      for (int i = 0; i < numArrays && q + 3 <= entryEnd; i++) {
+        q += 1; // array_completeness + NAL_unit_type
+        int numNalus = ((b[q] & 0xFF) << 8) | (b[q + 1] & 0xFF);
+        q += 2;
+        for (int j = 0; j < numNalus && q + 2 <= entryEnd; j++) {
+          int len = ((b[q] & 0xFF) << 8) | (b[q + 1] & 0xFF);
+          q += 2;
+          if (q + len > entryEnd) return;
+          out.write(0); out.write(0); out.write(0); out.write(1); // start code
+          out.write(b, q, len);
+          q += len;
+        }
+      }
+      if (out.size() > 0) {
+        t.csd0 = out.toByteArray();
+      }
+    } catch (Exception e) {
+      android.util.Log.w(TAG, "Failed to parse hvcC", e);
     }
   }
 
@@ -518,28 +565,43 @@ import java.util.List;
       if (!t.isVideo && !t.isAudio) continue;
       Format.Builder fb = new Format.Builder();
       if (t.isVideo) {
-        fb.setSampleMimeType(MimeTypes.VIDEO_H264);
-        fb.setWidth(t.width);
-        fb.setHeight(t.height);
-        fb.setCodecs("avc1.42001E");
-        List<byte[]> init = new ArrayList<>();
-        if (t.csd0 != null) init.add(t.csd0);
-        if (t.csd1 != null) init.add(t.csd1);
-        if (init.size() != 2) {
-          // avcCBox requires BOTH csd-0 and csd-1. If either is missing, discard
-          // partial data and rely on the sample-bitstream fallback instead.
-          init.clear();
-          if (firstVideoSample != null) {
-            // mdat holds AVCC samples (length-prefixed), with Annex-B handled
-            // defensively. This is independent of the moov's stsd layout.
-            byte[][] spsPps = extractAvcSpsPpsFromBitstream(firstVideoSample);
-            if (spsPps != null) {
-              init.add(spsPps[0]);
-              init.add(spsPps[1]);
+        if (t.isHevc) {
+          // HEVC: hvcCBox needs all VPS/SPS/PPS packed into csd-0 (Annex-B).
+          fb.setSampleMimeType(MimeTypes.VIDEO_H265);
+          fb.setWidth(t.width);
+          fb.setHeight(t.height);
+          fb.setCodecs("hev1.1.6.L150.B0");
+          List<byte[]> init = new ArrayList<>();
+          if (t.csd0 != null) init.add(t.csd0);
+          if (init.isEmpty() && firstVideoSample != null) {
+            byte[] hvc = extractHevcCsdFromBitstream(firstVideoSample);
+            if (hvc != null) init.add(hvc);
+          }
+          if (!init.isEmpty()) fb.setInitializationData(init);
+        } else {
+          fb.setSampleMimeType(MimeTypes.VIDEO_H264);
+          fb.setWidth(t.width);
+          fb.setHeight(t.height);
+          fb.setCodecs("avc1.42001E");
+          List<byte[]> init = new ArrayList<>();
+          if (t.csd0 != null) init.add(t.csd0);
+          if (t.csd1 != null) init.add(t.csd1);
+          if (init.size() != 2) {
+            // avcCBox requires BOTH csd-0 and csd-1. If either is missing, discard
+            // partial data and rely on the sample-bitstream fallback instead.
+            init.clear();
+            if (firstVideoSample != null) {
+              // mdat holds AVCC samples (length-prefixed), with Annex-B handled
+              // defensively. This is independent of the moov's stsd layout.
+              byte[][] spsPps = extractAvcSpsPpsFromBitstream(firstVideoSample);
+              if (spsPps != null) {
+                init.add(spsPps[0]);
+                init.add(spsPps[1]);
+              }
             }
           }
+          if (init.size() == 2) fb.setInitializationData(init);
         }
-        if (init.size() == 2) fb.setInitializationData(init);
       } else {
         fb.setSampleMimeType(MimeTypes.AUDIO_AAC);
         fb.setSampleRate(t.sampleRate);
@@ -632,6 +694,84 @@ import java.util.List;
     }
     if (sps == null || pps == null) return null;
     return new byte[][]{sps, pps};
+  }
+
+  /**
+   * Extracts HEVC codec data (VPS+SPS+PPS) from the first video sample and packs
+   * them into the single Annex-B csd-0 that media3's hvcCBox requires.
+   *
+   * <p>The mdat holds length-prefixed (AVCC-style) samples; the first keyframe
+   * carries VPS (type 32), SPS (type 33) and PPS (type 34) NAL units. Annex-B
+   * input is handled defensively as well. HEVC NAL type is encoded in bits
+   * 1..6 of the first byte (not 0..4 like AVC).
+   */
+  private static byte[] extractHevcCsdFromBitstream(byte[] data) {
+    if (data == null || data.length < 8) return null;
+    java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+    boolean foundVps = false;
+    boolean foundSps = false;
+    boolean foundPps = false;
+
+    // Try AVCC-style first: [4-byte length][NAL]...
+    if (looksLikeAvcc(data)) {
+      int pos = 0;
+      int end = data.length;
+      while (pos + 4 <= end && !(foundVps && foundSps && foundPps)) {
+        int len = readIntBE(data, pos);
+        if (len <= 0 || pos + 4 + len > end) break;
+        int nalType = (data[pos + 4] >> 1) & 0x3F; // HEVC type in bits 1..6
+        if (nalType == 32 || nalType == 33 || nalType == 34) {
+          byte[] nalu = wrapWithStartCode(data, pos + 4, len);
+          out.write(nalu, 0, nalu.length);
+          if (nalType == 32) foundVps = true;
+          else if (nalType == 33) foundSps = true;
+          else if (nalType == 34) foundPps = true;
+        }
+        pos += 4 + len;
+      }
+      if (foundVps && foundSps && foundPps) return out.toByteArray();
+    }
+
+    // Annex-B fallback: [start code][NAL]...
+    out.reset();
+    foundVps = foundSps = foundPps = false;
+    int pos = 0;
+    int end = data.length;
+    while (pos < end - 3 && !(foundVps && foundSps && foundPps)) {
+      int startCodeLen;
+      if (data[pos] == 0 && data[pos + 1] == 0 && data[pos + 2] == 0 && data[pos + 3] == 1) {
+        startCodeLen = 4;
+      } else if (data[pos] == 0 && data[pos + 1] == 0 && data[pos + 2] == 1) {
+        startCodeLen = 3;
+      } else {
+        pos++;
+        continue;
+      }
+      int nalStart = pos + startCodeLen;
+      int nalEnd = nalStart;
+      while (nalEnd < end - 2) {
+        if (data[nalEnd] == 0 && data[nalEnd + 1] == 0) {
+          if (nalEnd + 2 < end && data[nalEnd + 2] == 1) break;
+          if (nalEnd + 3 < end && data[nalEnd + 2] == 0 && data[nalEnd + 3] == 1) break;
+        }
+        nalEnd++;
+      }
+      if (nalEnd >= end - 2) nalEnd = end;
+      if (nalStart < nalEnd) {
+        int nalType = (data[nalStart] >> 1) & 0x3F; // HEVC type in bits 1..6
+        if (nalType == 32 || nalType == 33 || nalType == 34) {
+          byte[] nalu = new byte[nalEnd - pos];
+          System.arraycopy(data, pos, nalu, 0, nalu.length);
+          out.write(nalu, 0, nalu.length);
+          if (nalType == 32) foundVps = true;
+          else if (nalType == 33) foundSps = true;
+          else if (nalType == 34) foundPps = true;
+        }
+      }
+      pos = nalEnd;
+    }
+    if (foundVps && foundSps && foundPps) return out.toByteArray();
+    return null;
   }
 
   /** True when the data looks like AVCC: a plausible 4-byte NAL length header. */
