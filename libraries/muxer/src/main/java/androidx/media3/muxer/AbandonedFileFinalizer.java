@@ -46,6 +46,64 @@ import java.util.List;
 
   private AbandonedFileFinalizer() {}
 
+  /**
+   * Reads back the FIRST VIDEO sample of a (finalized) hybrid/fMP4 file and
+   * reports its framing — Annex-B (start codes) vs AVCC (length prefixes).
+   * This observes what was actually WRITTEN to the file, independent of any
+   * in-memory assumptions, so a "successfully finalized" file with broken
+   * samples is visible in logs instead of guessed.
+   */
+  public static String auditFirstVideoSample(java.nio.channels.FileChannel readChannel) {
+    try {
+      FileInfo info = walkTopLevelBoxes(readChannel);
+      if (info.moofPositions.isEmpty()) {
+        return "no-moofs";
+      }
+      List<TrackInfo> tracks = parseMoov(info.initSegment);
+      if (tracks.isEmpty()) {
+        return "no-tracks";
+      }
+      parseMoofs(readChannel, info, tracks);
+      TrackInfo video = null;
+      for (TrackInfo t : tracks) {
+        if (t.isVideo && !t.fragmentDataOffsets.isEmpty()) {
+          video = t;
+          break;
+        }
+      }
+      if (video == null || video.sampleSizes.isEmpty()) {
+        return "no-video-samples";
+      }
+      long off = video.fragmentDataOffsets.get(0);
+      int sampleSize = video.sampleSizes.get(0);
+      int len = Math.min(sampleSize, 32);
+      byte[] head = readBytes(readChannel, off, len);
+      StringBuilder hex = new StringBuilder();
+      for (byte b : head) {
+        hex.append(String.format("%02X ", b));
+      }
+      boolean annexB =
+          (head.length >= 4 && head[0] == 0 && head[1] == 0 && head[2] == 0 && head[3] == 1)
+              || (head.length >= 3 && head[0] == 0 && head[1] == 0 && head[2] == 1);
+      boolean lengthPrefixed =
+          head.length >= 5
+              && head[0] == 0
+              && head[1] == 0
+              && head[2] == 0
+              && head[3] > 1
+              && head[3] < 100
+              && (head[4] & 0x80) != 0;
+      return "size=" + sampleSize
+          + " head=" + hex.toString().trim()
+          + " annexB=" + annexB
+          + " lengthPrefixed=" + lengthPrefixed
+          + " firstFragmentSamples="
+          + (video.fragmentSampleCounts.isEmpty() ? "?" : video.fragmentSampleCounts.get(0));
+    } catch (Exception e) {
+      return "audit-failed: " + e;
+    }
+  }
+
   /** Container-level info gathered while walking the file's top-level boxes. */
   private static final class FileInfo {
     byte[] initSegment = new byte[0];

@@ -60,6 +60,10 @@ import org.checkerframework.checker.nullness.qual.PolyNull;
 
 /** Writes out various types of boxes as per MP4 (ISO/IEC 14496-12) standards. */
 /* package */ final class Boxes {
+  /** One-shot avcC build diagnostic (first build per process). */
+  private static final java.util.concurrent.atomic.AtomicInteger avcCDiag =
+      new java.util.concurrent.atomic.AtomicInteger(0);
+
   /** Total number of bytes in an integer. */
   private static final int BYTES_PER_INTEGER = 4;
 
@@ -1460,6 +1464,18 @@ import org.checkerframework.checker.nullness.qual.PolyNull;
     pps.rewind();
 
     contents.flip();
+
+    // ── AVC diagnostics (one-shot): what went INTO the avcC box — SPS/PPS NAL
+    // lengths after start-code stripping + profile/level. A wrong SPS length or
+    // a truncated SPS (start-code-like bytes inside the payload) would show here.
+    if (avcCDiag.getAndIncrement() == 0) {
+      android.util.Log.i(
+          "Boxes",
+          "[AVCC-CONV] avcC built: spsLen=" + sps.remaining()
+              + " ppsLen=" + pps.remaining()
+              + " profile=" + h264SpsData.profileIdc
+              + " level=" + h264SpsData.levelIdc);
+    }
     return BoxUtils.wrapIntoBox("avcC", contents);
   }
 

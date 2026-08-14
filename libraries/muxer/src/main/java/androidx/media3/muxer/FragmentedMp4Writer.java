@@ -143,6 +143,8 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
   private int nextTrackId;
   /** AVC corruption tracing: bounded counter for converted-sample diagnostics. */
   private int sampleConvertDiagCount = 0;
+  private int emptyConvertDiagCount = 0;
+  private int fragmentDiagCount = 0;
 
   /**
    * Creates an instance.
@@ -477,6 +479,23 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
       return;
     }
 
+    // ── AVC diagnostics (first 3 fragments): per-track sample counts and total
+    // sample bytes inside each fragment — confirms fragments actually carry the
+    // encoded data (conversion emptying samples would show as tiny totals).
+    if (fragmentDiagCount < 3) {
+      fragmentDiagCount++;
+      StringBuilder perTrack = new StringBuilder();
+      for (int i = 0; i < trackInfos.size(); i++) {
+        ProcessedTrackInfo ti = trackInfos.get(i);
+        perTrack.append("track").append(ti.trackId).append("=")
+            .append(ti.pendingSamplesMetadata.size()).append("samples/")
+            .append(ti.totalSamplesSize).append("B ");
+      }
+      android.util.Log.i(
+          "FragmentedMp4Writer",
+          "[AVCC-CONV] fragment#" + fragmentDiagCount + " " + perTrack.toString().trim());
+    }
+
     int fragNum = currentFragmentSequenceNumber;
     currentFragmentSequenceNumber++;
     long fragMaxDurationUs = getMaxTrackDurationUs(trackInfos, tracks);
@@ -577,6 +596,16 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
         ByteBuffer currentSampleByteBuffer = track.pendingSamplesByteBuffer.removeFirst();
         currentSampleByteBuffer =
             annexBToAvccConverter.process(currentSampleByteBuffer, linearByteBufferAllocator);
+        // ── AVC diagnostics: a conversion that yields ZERO bytes means the
+        // converter found no NAL units (already-AVCC sample or un-splittable
+        // stream) — the sample is silently lost from the file.
+        if (emptyConvertDiagCount < 3 && !currentSampleByteBuffer.hasRemaining()) {
+          emptyConvertDiagCount++;
+          android.util.Log.w(
+              "FragmentedMp4Writer",
+              "[AVCC-CONV] WARNING: conversion produced EMPTY sample #"
+                  + emptyConvertDiagCount + " (track=" + trackId + ")");
+        }
         // AVC corruption tracing (first 2 converted video samples only):
         // valid AVCC starts with a 4-byte NAL length, e.g. 00 00 00 16 67...
         if (sampleConvertDiagCount < 2 && MimeTypes.isVideo(track.format.sampleMimeType)) {

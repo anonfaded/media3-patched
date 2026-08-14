@@ -244,6 +244,11 @@ public final class FragmentedMp4Muxer implements Muxer {
     return AbandonedFileFinalizer.finalize(channel);
   }
 
+  /** Reads back the first video sample's framing from a finalized file (diagnostics). */
+  public static String auditFirstVideoSample(java.nio.channels.FileChannel readChannel) {
+    return AbandonedFileFinalizer.auditFirstVideoSample(readChannel);
+  }
+
   /**
    * Two-channel variant for SAF file descriptors: pass a readable channel
    * (FileInputStream(fd).getChannel()) and a writable channel

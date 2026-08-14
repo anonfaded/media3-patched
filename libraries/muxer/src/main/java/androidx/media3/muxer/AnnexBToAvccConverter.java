@@ -26,6 +26,10 @@ import java.nio.ByteBuffer;
  */
 @UnstableApi
 public interface AnnexBToAvccConverter {
+  /** One-shot diagnostics counter for the default converter (first 3 conversions). */
+  java.util.concurrent.atomic.AtomicInteger DIAG_COUNT =
+      new java.util.concurrent.atomic.AtomicInteger(0);
+
   /** Default implementation for {@link AnnexBToAvccConverter}. */
   AnnexBToAvccConverter DEFAULT =
       new AnnexBToAvccConverter() {
@@ -41,6 +45,48 @@ public interface AnnexBToAvccConverter {
           }
 
           ImmutableList<ByteBuffer> nalUnitList = AnnexBUtils.findNalUnits(inputBuffer);
+
+          // ── Defensive fix: a sample with NO start codes is already
+          // length-prefixed (AVCC) or otherwise un-splittable. Converting it
+          // would produce an EMPTY buffer and silently destroy the sample —
+          // pass it through unchanged instead. (The writer only converts when
+          // the format is H264/H265, so an AVCC sample here means a mixed
+          // Annex-B/AVCC stream from the encoder.)
+          if (nalUnitList.isEmpty()) {
+            if (DIAG_COUNT.get() < 3) {
+              DIAG_COUNT.incrementAndGet();
+              StringBuilder hex = new StringBuilder();
+              int shown = Math.min(16, inputBuffer.remaining());
+              for (int i = 0; i < shown; i++) {
+                hex.append(String.format("%02X ", inputBuffer.get(inputBuffer.position() + i)));
+              }
+              android.util.Log.w(
+                  "AnnexBToAvccConverter",
+                  "[AVCC-CONV] sample#" + DIAG_COUNT.get()
+                      + " no NAL units found (already AVCC?) — passing through unchanged,"
+                      + " inputSize=" + inputBuffer.remaining()
+                      + " head=" + hex.toString().trim());
+            }
+            return inputBuffer;
+          }
+
+          // ── AVC diagnostics (first 3 samples per process): observe exactly what
+          // the Annex-B→AVCC conversion does with each encoder's stream.
+          if (DIAG_COUNT.get() < 3) {
+            DIAG_COUNT.incrementAndGet();
+            int diagN = DIAG_COUNT.get();
+            StringBuilder hex = new StringBuilder();
+            int shown = Math.min(16, inputBuffer.remaining());
+            for (int i = 0; i < shown; i++) {
+              hex.append(String.format("%02X ", inputBuffer.get(inputBuffer.position() + i)));
+            }
+            android.util.Log.i(
+                "AnnexBToAvccConverter",
+                "[AVCC-CONV] sample#" + diagN
+                    + " inputSize=" + inputBuffer.remaining()
+                    + " nalCount=" + nalUnitList.size()
+                    + " inputHead=" + hex.toString().trim());
+          }
 
           int totalBytesNeeded = 0;
 
@@ -60,6 +106,22 @@ public interface AnnexBToAvccConverter {
             outputBuffer.put(currentNalUnit);
           }
           outputBuffer.rewind();
+          // ── AVC diagnostics: post-conversion head (must be a 4-byte NAL length,
+          // e.g. 00 00 00 13 67… — a 00 00 00 01 head means the conversion output
+          // is not a valid length-prefixed stream).
+          int diagN = DIAG_COUNT.get();
+          if (diagN <= 2 && nalUnitList.size() > 0) {
+            StringBuilder outHex = new StringBuilder();
+            int shown = Math.min(16, outputBuffer.remaining());
+            for (int i = 0; i < shown; i++) {
+              outHex.append(String.format("%02X ", outputBuffer.get(i)));
+            }
+            android.util.Log.i(
+                "AnnexBToAvccConverter",
+                "[AVCC-CONV] output#" + diagN
+                    + " size=" + outputBuffer.remaining()
+                    + " head=" + outHex.toString().trim());
+          }
           return outputBuffer;
         }
       };
