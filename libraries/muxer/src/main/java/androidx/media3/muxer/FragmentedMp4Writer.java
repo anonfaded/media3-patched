@@ -604,7 +604,13 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
           android.util.Log.w(
               "FragmentedMp4Writer",
               "[AVCC-CONV] WARNING: conversion produced EMPTY sample #"
-                  + emptyConvertDiagCount + " (track=" + trackId + ")");
+                  + emptyConvertDiagCount + " (track=" + trackId + ") — sample dropped");
+        }
+        if (!currentSampleByteBuffer.hasRemaining()) {
+          // Drop the empty sample instead of writing a zero-size trun entry —
+          // a 0-byte sample can trip strict extractors.
+          track.pendingSamplesBufferInfo.removeFirst();
+          continue;
         }
         // AVC corruption tracing (first 2 converted video samples only):
         // valid AVCC starts with a 4-byte NAL length, e.g. 00 00 00 16 67...

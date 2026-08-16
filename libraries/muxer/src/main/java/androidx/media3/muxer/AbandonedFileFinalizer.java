@@ -98,10 +98,45 @@ import java.util.List;
           + " annexB=" + annexB
           + " lengthPrefixed=" + lengthPrefixed
           + " firstFragmentSamples="
-          + (video.fragmentSampleCounts.isEmpty() ? "?" : video.fragmentSampleCounts.get(0));
+          + (video.fragmentSampleCounts.isEmpty() ? "?" : video.fragmentSampleCounts.get(0))
+          + perFragmentFraming(readChannel, video);
     } catch (Exception e) {
       return "audit-failed: " + e;
     }
+  }
+
+  /**
+   * Classifies the first video sample of each fragment as Annex-B vs
+   * length-prefixed. A length-prefixed track (avcC) that contains Annex-B
+   * sample data anywhere is exactly what "Invalid NAL length" players
+   * report — this pinpoints WHICH fragment breaks.
+   */
+  private static String perFragmentFraming(java.nio.channels.FileChannel readChannel, TrackInfo video) {
+    StringBuilder sb = new StringBuilder(" frags=");
+    int count = Math.min(video.fragmentDataOffsets.size(), 8);
+    for (int i = 0; i < count; i++) {
+      if (i > 0) sb.append(',');
+      byte[] fhead;
+      try {
+        fhead = readBytes(readChannel, video.fragmentDataOffsets.get(i), 5);
+      } catch (Exception e) {
+        sb.append(i).append(":err");
+        continue;
+      }
+      boolean fAnnexB =
+          (fhead.length >= 4 && fhead[0] == 0 && fhead[1] == 0 && fhead[2] == 0 && fhead[3] == 1)
+              || (fhead.length >= 3 && fhead[0] == 0 && fhead[1] == 0 && fhead[2] == 1);
+      boolean fLenPref =
+          fhead.length >= 5
+              && fhead[0] == 0
+              && fhead[1] == 0
+              && fhead[2] == 0
+              && fhead[3] > 1
+              && fhead[3] < 100
+              && (fhead[4] & 0x80) != 0;
+      sb.append(i).append(':').append(fAnnexB ? "ANNEXB" : (fLenPref ? "lenpfx" : "??"));
+    }
+    return sb.toString();
   }
 
   /** Container-level info gathered while walking the file's top-level boxes. */

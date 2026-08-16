@@ -91,8 +91,13 @@ public interface AnnexBToAvccConverter {
           int totalBytesNeeded = 0;
 
           for (int i = 0; i < nalUnitList.size(); i++) {
-            // 4 bytes to store NAL unit length.
-            totalBytesNeeded += 4 + nalUnitList.get(i).remaining();
+            // 4 bytes to store NAL unit length. Zero-length NAL units
+            // (adjacent start codes in a broken encoder stream) are skipped —
+            // a 00 00 00 00 length prefix would corrupt the sample for strict
+            // extractors.
+            if (nalUnitList.get(i).remaining() > 0) {
+              totalBytesNeeded += 4 + nalUnitList.get(i).remaining();
+            }
           }
 
           ByteBuffer outputBuffer = byteBufferAllocator.allocate(totalBytesNeeded);
@@ -100,6 +105,9 @@ public interface AnnexBToAvccConverter {
           for (int i = 0; i < nalUnitList.size(); i++) {
             ByteBuffer currentNalUnit = nalUnitList.get(i);
             int currentNalUnitLength = currentNalUnit.remaining();
+            if (currentNalUnitLength <= 0) {
+              continue;
+            }
 
             // Rewrite NAL units with NAL unit length in place of start code.
             outputBuffer.putInt(currentNalUnitLength);
