@@ -86,13 +86,10 @@ import java.util.List;
           (head.length >= 4 && head[0] == 0 && head[1] == 0 && head[2] == 0 && head[3] == 1)
               || (head.length >= 3 && head[0] == 0 && head[1] == 0 && head[2] == 1);
       boolean lengthPrefixed =
-          head.length >= 5
+          !annexB
+              && head.length >= 5
               && head[0] == 0
-              && head[1] == 0
-              && head[2] == 0
-              && head[3] > 1
-              && head[3] < 100
-              && (head[4] & 0x80) != 0;
+              && (head[4] & 0x80) == 0;
       return "size=" + sampleSize
           + " head=" + hex.toString().trim()
           + " annexB=" + annexB
@@ -126,14 +123,13 @@ import java.util.List;
       boolean fAnnexB =
           (fhead.length >= 4 && fhead[0] == 0 && fhead[1] == 0 && fhead[2] == 0 && fhead[3] == 1)
               || (fhead.length >= 3 && fhead[0] == 0 && fhead[1] == 0 && fhead[2] == 1);
+      // Length-prefixed AVCC: first prefix byte 0 (length < 16MB) and the NAL
+      // header's forbidden_zero_bit clear. Annex-B takes priority above.
       boolean fLenPref =
-          fhead.length >= 5
+          !fAnnexB
+              && fhead.length >= 5
               && fhead[0] == 0
-              && fhead[1] == 0
-              && fhead[2] == 0
-              && fhead[3] > 1
-              && fhead[3] < 100
-              && (fhead[4] & 0x80) != 0;
+              && (fhead[4] & 0x80) == 0;
       sb.append(i).append(':').append(fAnnexB ? "ANNEXB" : (fLenPref ? "lenpfx" : "??"));
     }
     return sb.toString();
@@ -143,6 +139,7 @@ import java.util.List;
   private static final class FileInfo {
     byte[] initSegment = new byte[0];
     final List<Long> moofPositions = new ArrayList<>();
+    boolean hasTrailingMoov = false;
   }
 
   /** Per-track info parsed from the init segment's moov. */
@@ -195,6 +192,11 @@ import java.util.List;
       FileInfo info = walkTopLevelBoxes(readChannel);
       if (info.moofPositions.isEmpty()) {
         // Not a fragmented MP4 (already hybrid, plain MP4, or not video) — nothing to do.
+        return 0;
+      }
+      if (info.hasTrailingMoov) {
+        // A moov AFTER the fragments means hybrid finalization already ran —
+        // re-finalizing would append a SECOND moov and corrupt the file.
         return 0;
       }
       if (info.initSegment.length == 0) return -1;
@@ -313,25 +315,43 @@ import java.util.List;
       hdr.flip();
       int size = hdr.getInt();
       int type = hdr.getInt();
-      if (size < 8 || pos + size > fileSize) break;
+      long realSize = size;
+      if (size == 1 && type == 0x6D646174) {
+        // Extended largesize form (post-fix finalization writes the mdat
+        // header this way): read the 64-bit size before the size<8 check —
+        // treating size==1 as "too small" used to terminate the walk here.
+        ByteBuffer ext = ByteBuffer.allocate(8);
+        ch.position(pos + 8);
+        readFully(ch, ext);
+        ext.flip();
+        realSize = ext.getLong();
+      }
+      if (realSize < 8 || pos + realSize > fileSize) break;
       if (type == 0x6D6F6F66) { // 'moof'
         if (firstMoof < 0) firstMoof = pos;
         info.moofPositions.add(pos);
+      } else if (type == 0x6D6F6F76) { // 'moov'
+        if (firstMoof >= 0) info.hasTrailingMoov = true;
       } else if (type == 0x66747970 && ftypSize < 0) { // 'ftyp'
         ftypSize = size;
       } else if (type == 0x6D646174 && ftypSize >= 0 && pos == ftypSize) {
         // DAMAGED-LAYOUT RECOVERY (previous buggy build): the 16-byte free
         // placeholder right after ftyp was overwritten with an mdat header
-        // claiming the whole file, hiding the init moov inside. If the bytes
-        // after that header really are a 'moov' box, continue the walk from
-        // ftypSize + 16 as if the placeholder were still the free box.
-        byte[] probe = readBytes(ch, ftypSize + 8, Math.min(16, (int) (fileSize - ftypSize - 8)));
-        if (probe.length >= 12 && readIntBE(probe, 8) == 0x6D6F6F76) { // 'moov'
+        // claiming the whole file, hiding the init moov inside. Layout after
+        // the patch: [mdat hdr (8 or 16 bytes)][maybe 8 stale zeros][moov].
+        // The moov box starts at ftypSize + 16 in BOTH layouts — its size at
+        // probe offset 8, its type 'moov' at probe offset 12. (Probing offset
+        // 8 for the TYPE was the old bug that returned "no-moofs".)
+        byte[] probe = readBytes(ch, ftypSize + 8, Math.min(20, (int) (fileSize - ftypSize - 8)));
+        if (probe.length >= 16
+            && readIntBE(probe, 12) == 0x6D6F6F76 // 'moov'
+            && readIntBE(probe, 8) >= 8
+            && readIntBE(probe, 8) <= fileSize) {
           pos = ftypSize + 16;
           continue;
         }
       }
-      pos += size;
+      pos += realSize;
     }
     if (firstMoof > 0) {
       info.initSegment = readBytes(ch, 0, (int) firstMoof);
@@ -942,13 +962,24 @@ import java.util.List;
   // ---- low-level helpers ----
 
   private static int findBox(byte[] b, int start, int type) {
+    // Single-purpose lookup for 'moov' inside the init-segment blob. The blob
+    // is [0..firstMoof) and starts with [ftyp][free|mdat-header][moov] — the
+    // patched mdat header has size==1 plus a 64-bit largesize spanning the
+    // whole FILE, so a strict box walk can never cross it. Walk by sane box
+    // sizes where possible, otherwise step byte-aligned until the box type
+    // with a plausible size is found.
     int pos = start;
     while (pos + 8 <= b.length) {
       int size = readIntBE(b, pos);
       int t = readIntBE(b, pos + 4);
-      if (size < 8) break;
-      if (t == type) return pos;
-      pos += size;
+      if (t == type && size >= 8 && size <= b.length - pos) {
+        return pos;
+      }
+      if (t != 0x6D646174 && size >= 8 && size <= b.length - pos) {
+        pos += size;
+      } else {
+        pos += 4;
+      }
     }
     return -1;
   }
