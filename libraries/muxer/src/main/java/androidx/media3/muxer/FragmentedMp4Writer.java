@@ -589,8 +589,8 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
         new ImmutableList.Builder<>();
 
     long fragmentStartPts = getTrackDuration(track);
-    track.writtenSamples.addAll(track.pendingSamplesBufferInfo);
 
+    
     if (doesSampleContainAnnexBNalUnits(track.format)) {
       while (!track.pendingSamplesByteBuffer.isEmpty()) {
         ByteBuffer currentSampleByteBuffer = track.pendingSamplesByteBuffer.removeFirst();
@@ -645,6 +645,11 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
 
     boolean hasBFrame = false;
     ImmutableList<BufferInfo> pendingSamplesBufferInfo = pendingSamplesBufferInfoBuilder.build();
+    // Record samples with their FINAL sizes: Annex-B to AVCC conversion can
+    // shrink samples (e.g. QCOM multi-NAL samples lose trailing zero-length
+    // start codes), so the appended moov's stsz/chunk offsets must reflect
+    // what was actually written into the mdat, not the raw encoder sizes.
+    track.writtenSamples.addAll(pendingSamplesBufferInfo);
     List<Integer> sampleDurations =
         Boxes.convertPresentationTimestampsToDurationsVu(
             pendingSamplesBufferInfo,

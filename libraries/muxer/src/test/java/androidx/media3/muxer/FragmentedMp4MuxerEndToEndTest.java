@@ -117,12 +117,31 @@ public class FragmentedMp4MuxerEndToEndTest {
     checkNotNull(outputStream).close();
   }
 
+  private FragmentedMp4Muxer createMuxer() {
+    return new FragmentedMp4Muxer.Builder(
+            segment -> {
+              try {
+                ByteBuffer payload = segment.payload.duplicate();
+                if (payload.position() >= payload.limit()) {
+                  payload.rewind();
+                }
+                byte[] bytes = new byte[payload.remaining()];
+                payload.get(bytes);
+                checkNotNull(outputStream).write(bytes);
+                checkNotNull(outputStream).flush();
+              } catch (IOException e) {
+                throw new RuntimeException(e);
+              }
+            })
+        .build();
+  }
+
   @Test
   public void createFragmentedMp4File_fromInputFileSampleData_matchesExpected() throws Exception {
     @Nullable FragmentedMp4Muxer fragmentedMp4Muxer = null;
 
     try {
-      fragmentedMp4Muxer = new FragmentedMp4Muxer.Builder(checkNotNull(outputStream)).build();
+      fragmentedMp4Muxer = createMuxer();
       fragmentedMp4Muxer.addMetadataEntry(
           new Mp4TimestampData(
               /* creationTimestampSeconds= */ 100_000_000L,
@@ -149,7 +168,7 @@ public class FragmentedMp4MuxerEndToEndTest {
     @Nullable FragmentedMp4Muxer fragmentedMp4Muxer = null;
 
     try {
-      fragmentedMp4Muxer = new FragmentedMp4Muxer.Builder(checkNotNull(outputStream)).build();
+      fragmentedMp4Muxer = createMuxer();
       fragmentedMp4Muxer.addMetadataEntry(
           new Mp4TimestampData(
               /* creationTimestampSeconds= */ 100_000_000L,
@@ -176,7 +195,7 @@ public class FragmentedMp4MuxerEndToEndTest {
     @Nullable FragmentedMp4Muxer fragmentedMp4Muxer = null;
 
     try {
-      fragmentedMp4Muxer = new FragmentedMp4Muxer.Builder(checkNotNull(outputStream)).build();
+      fragmentedMp4Muxer = createMuxer();
       fragmentedMp4Muxer.addMetadataEntry(
           new Mp4TimestampData(
               /* creationTimestampSeconds= */ 100_000_000L,
@@ -202,7 +221,21 @@ public class FragmentedMp4MuxerEndToEndTest {
   public void createAv1FragmentedMp4File_withoutCsd_matchesExpected() throws Exception {
     String outputFilePath = temporaryFolder.newFile().getPath();
     FragmentedMp4Muxer mp4Muxer =
-        new FragmentedMp4Muxer.Builder(new FileOutputStream(outputFilePath)).build();
+        new FragmentedMp4Muxer.Builder(
+                segment -> {
+                  try {
+                    ByteBuffer payload = segment.payload.duplicate();
+                    if (payload.position() >= payload.limit()) {
+                      payload.rewind();
+                    }
+                    byte[] bytes = new byte[payload.remaining()];
+                    payload.get(bytes);
+                    new FileOutputStream(outputFilePath, true).write(bytes);
+                  } catch (IOException e) {
+                    throw new RuntimeException(e);
+                  }
+                })
+            .build();
 
     try {
       mp4Muxer.addMetadataEntry(
@@ -236,7 +269,21 @@ public class FragmentedMp4MuxerEndToEndTest {
       throws Exception {
     String outputFilePath = temporaryFolder.newFile().getPath();
     FragmentedMp4Muxer mp4Muxer =
-        new FragmentedMp4Muxer.Builder(new FileOutputStream(outputFilePath)).build();
+        new FragmentedMp4Muxer.Builder(
+                segment -> {
+                  try {
+                    ByteBuffer payload = segment.payload.duplicate();
+                    if (payload.position() >= payload.limit()) {
+                      payload.rewind();
+                    }
+                    byte[] bytes = new byte[payload.remaining()];
+                    payload.get(bytes);
+                    new FileOutputStream(outputFilePath, true).write(bytes);
+                  } catch (IOException e) {
+                    throw new RuntimeException(e);
+                  }
+                })
+            .build();
 
     try {
       mp4Muxer.addMetadataEntry(
