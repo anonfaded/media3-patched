@@ -16,14 +16,14 @@ apply from: "$gradle.ext.androidxMediaSettingsDir/common_library_config.gradle"
 apply plugin: 'kotlin-android'
 
 android {
-    namespace 'androidx.media3.docsamples'
+    namespace = 'androidx.media3.docsamples'
 
     kotlinOptions {
         jvmTarget = '1.8'
     }
 
     defaultConfig {
-        minSdkVersion 23
+        minSdkVersion = 23
     }
 }
 

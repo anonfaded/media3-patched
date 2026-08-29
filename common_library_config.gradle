@@ -17,31 +17,31 @@ apply plugin: 'com.android.library'
 group = 'androidx.media3'
 
 android {
-    compileSdkVersion project.ext.compileSdkVersion
+    compileSdkVersion = project.ext.compileSdkVersion
 
     defaultConfig {
-        minSdkVersion project.ext.minSdkVersion
-        targetSdkVersion project.ext.targetSdkVersion
+        minSdkVersion = project.ext.minSdkVersion
+        targetSdkVersion = project.ext.targetSdkVersion
         consumerProguardFiles 'proguard-rules.txt'
-        testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
+        testInstrumentationRunner = 'androidx.test.runner.AndroidJUnitRunner'
         aarMetadata {
             minCompileSdk = project.ext.compileSdkVersion
         }
     }
 
     lintOptions {
-        checkTestSources true
+checkTestSources = true
     }
 
     compileOptions {
-        sourceCompatibility JavaVersion.VERSION_1_8
-        targetCompatibility JavaVersion.VERSION_1_8
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
     }
 
     testOptions {
         unitTests.all {
             jvmArgs "-Xmx2g"
         }
-        unitTests.includeAndroidResources true
+unitTests.includeAndroidResources = true
     }
 }

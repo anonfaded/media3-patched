@@ -15,16 +15,16 @@ apply from: "$gradle.ext.androidxMediaSettingsDir/constants.gradle"
 apply plugin: 'com.android.application'
 
 android {
-    namespace 'androidx.media3.test.session'
+    namespace = 'androidx.media3.test.session'
 
-    compileSdk project.ext.compileSdkVersion
+    compileSdk = project.ext.compileSdkVersion
 
     defaultConfig {
-        versionName project.ext.releaseVersion
-        versionCode project.ext.releaseVersionCode
-        minSdkVersion project.ext.minSdkVersion
-        targetSdkVersion project.ext.appTargetSdkVersion
-        testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
+        versionName = project.ext.releaseVersion
+        versionCode = project.ext.releaseVersionCode
+        minSdkVersion = project.ext.minSdkVersion
+        targetSdkVersion = project.ext.appTargetSdkVersion
+        testInstrumentationRunner = 'androidx.test.runner.AndroidJUnitRunner'
     }
 
     compileOptions {

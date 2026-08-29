@@ -13,7 +13,7 @@
 // limitations under the License.
 apply from: "$gradle.ext.androidxMediaSettingsDir/common_library_config.gradle"
 android {
-    namespace 'androidx.media3.effect'
+    namespace = 'androidx.media3.effect'
 
     defaultConfig {
         // The following argument makes the Android Test Orchestrator run its
@@ -35,7 +35,7 @@ android {
 
     lintOptions {
         // TODO: b/353490583 - Enable this once the violations are fixed.
-        checkTestSources false
+checkTestSources = false
     }
 
     publishing {
