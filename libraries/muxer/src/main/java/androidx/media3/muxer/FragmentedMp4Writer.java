@@ -502,6 +502,7 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
     maxTrackDurationUs = 0;
 
     try {
+      long fragBuildStartNs = System.nanoTime();
       // Build moof+mdat now, while the pool is exclusively ours. combine() copies
       // everything into a fresh independent buffer before crossing threads.
       ImmutableList<ByteBuffer> trafBoxes = createTrafBoxes(trackInfos);
@@ -509,6 +510,16 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
       ByteBuffer mdat = getMdatBox(trackInfos);
       ProcessedSegment seg = new ProcessedSegment(false, fragNum,
           fragMaxDurationUs / 1_000, combine(moof, mdat));
+      long fragBuildMs = (System.nanoTime() - fragBuildStartNs) / 1_000_000L;
+      StringBuilder sb = new StringBuilder();
+      for (ProcessedTrackInfo ti : trackInfos) {
+        sb.append(" [t").append(ti.trackId).append("=")
+          .append(ti.pendingSamplesMetadata.size()).append("]");
+      }
+      android.util.Log.i(
+          "FragmentedMp4Writer",
+          "[FRAG-WRITE] frag=" + fragNum + " tookMs=" + fragBuildMs
+              + " maxDurMs=" + (fragMaxDurationUs / 1000) + " tracks:" + sb);
       segmentQueue.put(seg);
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
@@ -589,11 +600,15 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
         new ImmutableList.Builder<>();
 
     long fragmentStartPts = getTrackDuration(track);
+    int trackPreConversionBytes = 0;
+    int trackConvertedSamples = 0;
+    int trackDroppedSamples = 0;
 
     
     if (doesSampleContainAnnexBNalUnits(track.format)) {
       while (!track.pendingSamplesByteBuffer.isEmpty()) {
         ByteBuffer currentSampleByteBuffer = track.pendingSamplesByteBuffer.removeFirst();
+        trackPreConversionBytes += currentSampleByteBuffer.remaining();
         currentSampleByteBuffer =
             annexBToAvccConverter.process(currentSampleByteBuffer, linearByteBufferAllocator);
         // ── AVC diagnostics: a conversion that yields ZERO bytes means the
@@ -610,8 +625,10 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
           // Drop the empty sample instead of writing a zero-size trun entry —
           // a 0-byte sample can trip strict extractors.
           track.pendingSamplesBufferInfo.removeFirst();
+          trackDroppedSamples++;
           continue;
         }
+        trackConvertedSamples++;
         // AVC corruption tracing (first 2 converted video samples only):
         // valid AVCC starts with a 4-byte NAL length, e.g. 00 00 00 16 67...
         if (sampleConvertDiagCount < 2 && MimeTypes.isVideo(track.format.sampleMimeType)) {
@@ -675,6 +692,25 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
               pendingSamplesBufferInfo.get(i).flags,
               hasBFrame ? sampleCompositionTimeOffsets.get(i) : 0));
     }
+    // Per-fragment conversion telemetry: shows exactly what survived the
+    // Annex-B -> AVCC conversion (pre vs post bytes, dropped count).
+    if (!pendingSamplesBufferInfo.isEmpty() && trackConvertedSamples > 0) {
+      android.util.Log.i(
+          "FragmentedMp4Writer",
+          "[FRAG-TRACK] track="
+              + trackId
+              + " samples="
+              + pendingSamplesBufferInfo.size()
+              + " converted="
+              + trackConvertedSamples
+              + " dropped="
+              + trackDroppedSamples
+              + " preBytes="
+              + trackPreConversionBytes
+              + " postBytes="
+              + totalSamplesSize);
+    }
+
     return new ProcessedTrackInfo(
         trackId,
         track.format,
