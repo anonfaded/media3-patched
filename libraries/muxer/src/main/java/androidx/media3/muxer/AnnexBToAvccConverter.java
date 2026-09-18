@@ -30,6 +30,12 @@ public interface AnnexBToAvccConverter {
   java.util.concurrent.atomic.AtomicInteger DIAG_COUNT =
       new java.util.concurrent.atomic.AtomicInteger(0);
 
+  /** Profiling: nanos spent locating NAL units, nanos spent writing AVCC output, call count. */
+  java.util.concurrent.atomic.AtomicLong PROF_SCAN_NANOS = new java.util.concurrent.atomic.AtomicLong(0);
+  java.util.concurrent.atomic.AtomicLong PROF_WRITE_NANOS = new java.util.concurrent.atomic.AtomicLong(0);
+  java.util.concurrent.atomic.AtomicLong PROF_CALLS = new java.util.concurrent.atomic.AtomicLong(0);
+  java.util.concurrent.atomic.AtomicLong PROF_BYTES = new java.util.concurrent.atomic.AtomicLong(0);
+
   /** Default implementation for {@link AnnexBToAvccConverter}. */
   AnnexBToAvccConverter DEFAULT =
       new AnnexBToAvccConverter() {
@@ -38,13 +44,42 @@ public interface AnnexBToAvccConverter {
           return process(inputBuffer, ByteBufferAllocator.DEFAULT);
         }
 
+        /** Reusable scratch for samples that are not backed by a byte[]. */
+        private final ThreadLocal<byte[]> scratch = new ThreadLocal<>();
+
         @Override
         public ByteBuffer process(ByteBuffer inputBuffer, ByteBufferAllocator byteBufferAllocator) {
           if (!inputBuffer.hasRemaining()) {
             return inputBuffer;
           }
+          int size = inputBuffer.remaining();
+          int basePosition = inputBuffer.position();
 
-          ImmutableList<ByteBuffer> nalUnitList = AnnexBUtils.findNalUnits(inputBuffer);
+          // Get the sample bytes as a plain array: zero-copy when the buffer is array-backed,
+          // otherwise one bulk copy into a reused scratch buffer. Scanning the array is what turns
+          // this conversion from ~400 ms per fragment into a few ms.
+          byte[] data;
+          int dataOffset;
+          if (inputBuffer.hasArray()) {
+            data = inputBuffer.array();
+            dataOffset = inputBuffer.arrayOffset() + basePosition;
+          } else {
+            byte[] scratchBuffer = scratch.get();
+            if (scratchBuffer == null || scratchBuffer.length < size) {
+              scratchBuffer = new byte[size];
+              scratch.set(scratchBuffer);
+            }
+            ByteBuffer copy = inputBuffer.duplicate();
+            copy.position(basePosition);
+            copy.limit(basePosition + size);
+            copy.get(scratchBuffer, 0, size);
+            data = scratchBuffer;
+            dataOffset = 0;
+          }
+
+          long scanStartNs = System.nanoTime();
+          int[] nalRanges = AnnexBUtils.findNalUnitRanges(data, dataOffset, size);
+          PROF_SCAN_NANOS.addAndGet(System.nanoTime() - scanStartNs);
 
           // ── Defensive fix: a sample with NO start codes is already
           // length-prefixed (AVCC) or otherwise un-splittable. Converting it
@@ -52,83 +87,61 @@ public interface AnnexBToAvccConverter {
           // pass it through unchanged instead. (The writer only converts when
           // the format is H264/H265, so an AVCC sample here means a mixed
           // Annex-B/AVCC stream from the encoder.)
-          if (nalUnitList.isEmpty()) {
+          if (nalRanges.length == 0) {
             if (DIAG_COUNT.get() < 3) {
               DIAG_COUNT.incrementAndGet();
-              StringBuilder hex = new StringBuilder();
-              int shown = Math.min(16, inputBuffer.remaining());
-              for (int i = 0; i < shown; i++) {
-                hex.append(String.format("%02X ", inputBuffer.get(inputBuffer.position() + i)));
-              }
               android.util.Log.w(
                   "AnnexBToAvccConverter",
                   "[AVCC-CONV] sample#" + DIAG_COUNT.get()
                       + " no NAL units found (already AVCC?) — passing through unchanged,"
-                      + " inputSize=" + inputBuffer.remaining()
-                      + " head=" + hex.toString().trim());
+                      + " inputSize=" + size);
             }
             return inputBuffer;
           }
 
-          // ── AVC diagnostics (first 3 samples per process): observe exactly what
-          // the Annex-B→AVCC conversion does with each encoder's stream.
           if (DIAG_COUNT.get() < 3) {
             DIAG_COUNT.incrementAndGet();
-            int diagN = DIAG_COUNT.get();
-            StringBuilder hex = new StringBuilder();
-            int shown = Math.min(16, inputBuffer.remaining());
-            for (int i = 0; i < shown; i++) {
-              hex.append(String.format("%02X ", inputBuffer.get(inputBuffer.position() + i)));
-            }
             android.util.Log.i(
                 "AnnexBToAvccConverter",
-                "[AVCC-CONV] sample#" + diagN
-                    + " inputSize=" + inputBuffer.remaining()
-                    + " nalCount=" + nalUnitList.size()
-                    + " inputHead=" + hex.toString().trim());
+                "[AVCC-CONV] sample#" + DIAG_COUNT.get()
+                    + " inputSize=" + size
+                    + " nalCount=" + (nalRanges.length / 2));
           }
 
           int totalBytesNeeded = 0;
-
-          for (int i = 0; i < nalUnitList.size(); i++) {
+          for (int i = 0; i < nalRanges.length; i += 2) {
             // 4 bytes to store NAL unit length. Zero-length NAL units
             // (adjacent start codes in a broken encoder stream) are skipped —
             // a 00 00 00 00 length prefix would corrupt the sample for strict
             // extractors.
-            if (nalUnitList.get(i).remaining() > 0) {
-              totalBytesNeeded += 4 + nalUnitList.get(i).remaining();
+            int nalLength = nalRanges[i + 1] - nalRanges[i];
+            if (nalLength > 0) {
+              totalBytesNeeded += 4 + nalLength;
             }
           }
 
+          long writeStartNs = System.nanoTime();
           ByteBuffer outputBuffer = byteBufferAllocator.allocate(totalBytesNeeded);
 
-          for (int i = 0; i < nalUnitList.size(); i++) {
-            ByteBuffer currentNalUnit = nalUnitList.get(i);
-            int currentNalUnitLength = currentNalUnit.remaining();
-            if (currentNalUnitLength <= 0) {
+          for (int i = 0; i < nalRanges.length; i += 2) {
+            int nalLength = nalRanges[i + 1] - nalRanges[i];
+            if (nalLength <= 0) {
               continue;
             }
-
             // Rewrite NAL units with NAL unit length in place of start code.
-            outputBuffer.putInt(currentNalUnitLength);
-            outputBuffer.put(currentNalUnit);
+            outputBuffer.putInt(nalLength);
+            outputBuffer.put(data, nalRanges[i], nalLength);
           }
           outputBuffer.rewind();
-          // ── AVC diagnostics: post-conversion head (must be a 4-byte NAL length,
-          // e.g. 00 00 00 13 67… — a 00 00 00 01 head means the conversion output
-          // is not a valid length-prefixed stream).
-          int diagN = DIAG_COUNT.get();
-          if (diagN <= 2 && nalUnitList.size() > 0) {
-            StringBuilder outHex = new StringBuilder();
-            int shown = Math.min(16, outputBuffer.remaining());
-            for (int i = 0; i < shown; i++) {
-              outHex.append(String.format("%02X ", outputBuffer.get(i)));
-            }
-            android.util.Log.i(
-                "AnnexBToAvccConverter",
-                "[AVCC-CONV] output#" + diagN
-                    + " size=" + outputBuffer.remaining()
-                    + " head=" + outHex.toString().trim());
+          PROF_WRITE_NANOS.addAndGet(System.nanoTime() - writeStartNs);
+          PROF_BYTES.addAndGet(totalBytesNeeded);
+          long profCalls = PROF_CALLS.incrementAndGet();
+          if (profCalls % 500 == 0) {
+            android.util.Log.i("AnnexBToAvccConverter",
+                "[AVCC-PROF] calls=" + profCalls
+                    + " scanMs=" + (PROF_SCAN_NANOS.get() / 1_000_000L)
+                    + " writeMs=" + (PROF_WRITE_NANOS.get() / 1_000_000L)
+                    + " bytes=" + PROF_BYTES.get());
           }
           return outputBuffer;
         }

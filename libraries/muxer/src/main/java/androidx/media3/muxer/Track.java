@@ -40,6 +40,17 @@ import java.util.List;
   public boolean hadKeyframe;
   @Nullable public byte[] parsedCsd;
   public long endOfStreamTimestampUs;
+  /**
+   * Running sum of the durations (in the track timebase) of every sample that has
+   * already been written into a completed fragment. Maintained incrementally so the
+   * per-fragment code paths are O(1) instead of re-walking {@link #writtenSamples}
+   * (which made fragment finalization cost grow linearly with recording length).
+   */
+  public long completedDurationVu;
+  /** Diagnostic: cumulative nanos spent copying incoming samples (per-sample alloc+copy). */
+  public long sampleCopyNanos;
+  /** Diagnostic: cumulative nanos spent in Annex-B → AVCC conversion for this track. */
+  public long convertNanos;
 
   private final boolean sampleCopyEnabled;
 
@@ -94,9 +105,11 @@ import java.util.List;
     ByteBuffer byteBufferToAdd = byteBuffer;
     if (sampleCopyEnabled) {
       // Copy sample data and release the original buffer.
+      long copyStartNs = System.nanoTime();
       byteBufferToAdd = ByteBuffer.allocateDirect(byteBuffer.remaining());
       byteBufferToAdd.put(byteBuffer);
       byteBufferToAdd.rewind();
+      sampleCopyNanos += System.nanoTime() - copyStartNs;
     }
 
     // Always copy the buffer info as it is retained until the track is finalized.

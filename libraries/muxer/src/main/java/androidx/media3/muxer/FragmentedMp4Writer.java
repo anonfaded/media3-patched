@@ -118,16 +118,32 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
   private final boolean sampleCopyEnabled;
   private final @Mp4Muxer.LastSampleDurationBehavior int lastSampleDurationBehavior;
   private final List<Track> tracks;
-  private final LinearByteBufferAllocator linearByteBufferAllocator;
+
+  /**
+   * Pool of per-fragment linear allocators.
+   *
+   * <p>Each fragment owns exactly one allocator for its lifetime. Converted (Annex-B → AVCC)
+   * sample data is written into that allocator on the drain thread and then read by the writer
+   * thread when it builds the moof/mdat boxes. Because no two fragments ever share an allocator,
+   * the previous data race (writer thread reading pool memory that the drain thread had already
+   * reset and reused for the next fragment, producing misaligned NAL length prefixes) is
+   * impossible by construction — while still reusing buffers instead of allocating ~15 MB per
+   * fragment.
+   */
+  private final java.util.ArrayDeque<LinearByteBufferAllocator> fragmentAllocatorPool =
+      new java.util.ArrayDeque<>();
+  private static final int MAX_POOLED_ALLOCATORS = 6;
 
   /** Dedicated writer thread that calls segmentConsumer.accept() asynchronously.
-   *  This decouples disk/network I/O from the encoder drain thread, eliminating
-   *  the periodic ~2-3s stutter caused by fragment finalization + fsync blocking
-   *  the encoder pipeline.
+   *  This decouples fragment box construction (moof/mdat assembly, multi-MB buffer
+   *  allocations) and disk/network I/O from the encoder drain thread. Keeping it off
+   *  the drain thread is what prevents the periodic ~2-3 s encoder stutter: the drain
+   *  thread is the only thread that releases MediaCodec output buffers, so any time it
+   *  spends inside fragment finalization starves the encoder and stalls the camera.
    *
-   *  The queue holds ProcessedSegment (init header + final combined media
-   *  fragments). Box construction happens on the drain thread — the writer
-   *  thread only performs the final segment I/O. */
+   *  The queue holds either a ProcessedSegment (init header) or a FragmentTask whose
+   *  sample buffers are owned by that fragment (per-fragment allocator), so the writer
+   *  thread can safely build the boxes. */
   private final BlockingQueue<Object> segmentQueue;
   private final Thread writerThread;
   private volatile IOException writerError;
@@ -177,7 +193,6 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
     tracks = new ArrayList<>();
     minInputPresentationTimeUs = Long.MAX_VALUE;
     currentFragmentSequenceNumber = 1;
-    linearByteBufferAllocator = new LinearByteBufferAllocator(/* initialCapacity= */ 0);
 
     // Start the dedicated writer thread that performs the final segment I/O
     // (segmentConsumer.accept) asynchronously. This prevents disk/network I/O
@@ -185,8 +200,7 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
     //
     // NOTE: moof/mdat BOX BUILDING deliberately stays on the drain thread
     // (inside createFragment). The AnnexB→AVCC converter writes into the shared
-    // linearByteBufferAllocator pool; if the pool were read on this writer
-    // thread after the drain thread reset/reused it for the next fragment, the
+    // fragment's own allocator; if that memory were shared with a later fragment, the
     // sample data would be silently corrupted (misaligned NAL length prefixes —
     // "Invalid NAL unit size" in ffprobe). Only the FINAL combined segment
     // buffer (an independent allocation) crosses the thread boundary.
@@ -199,6 +213,8 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
           }
           if (item instanceof ProcessedSegment) {
             segmentConsumer.accept((ProcessedSegment) item);
+          } else if (item instanceof FragmentTask) {
+            buildAndEmitFragment((FragmentTask) item);
           }
         } catch (InterruptedException e) {
           Thread.currentThread().interrupt();
@@ -224,27 +240,6 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
   }
 
 
-  /**
-   * Return the duration of all written samples so far of track in timebase units.
-   *
-   * @param track The track to calculate duration from.
-   * @return The sum of duration from all written samples.
-   */
-  private long getTrackDuration(Track track) {
-    List<Integer> durations = Boxes.convertPresentationTimestampsToDurationsVu(
-        track.writtenSamples,
-        track.videoUnitTimebase(),
-        LAST_SAMPLE_DURATION_BEHAVIOR_SET_FROM_END_OF_STREAM_BUFFER_OR_DUPLICATE_PREVIOUS,
-        track.endOfStreamTimestampUs
-    );
-    long duration  = 0;
-
-    for (int i = 0 ; i < durations.size() ; i ++) {
-      duration += durations.get(i);
-    }
-
-    return duration;
-  }
   public void writeSampleData(Track track, ByteBuffer byteBuffer, BufferInfo bufferInfo)
       throws IOException {
     // Fast-fail if the writer thread has already errored.
@@ -457,25 +452,37 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
    * @param tracks - After tracks been processed tracks should include all samples that will be written in this segment.
    * @return The duration in micro seconds.
    */
-  private long getMaxTrackDurationUs(List<ProcessedTrackInfo> processedTrackInfos, List<Track> tracks) {
+  /**
+   * Maximum fragment duration (µs) across tracks — computed from THIS fragment's samples only.
+   *
+   * <p>Previously this walked every sample written so far (cumulative {@code writtenSamples}) and
+   * allocated boxed duration lists on each call, which made fragment finalization cost grow
+   * linearly with recording length. The per-fragment duration is now carried in
+   * {@link ProcessedTrackInfo#fragmentDurationUs}.
+   */
+  private long getMaxTrackDurationUs(List<ProcessedTrackInfo> processedTrackInfos) {
     long maxDuration = 0;
-
-    for (int i = 0 ; i < processedTrackInfos.size() ; i++) {
-      maxDuration = max(maxDuration, ((getTrackDuration(tracks.get(i)) - processedTrackInfos.get(i).fragmentPts) * 1_000_000)/tracks.get(i).videoUnitTimebase());
+    for (int i = 0; i < processedTrackInfos.size(); i++) {
+      maxDuration = max(maxDuration, processedTrackInfos.get(i).fragmentDurationUs);
     }
     return maxDuration;
   }
   private void createFragment() throws IOException {
-    /* All work that touches the shared linearByteBufferAllocator pool (AnnexB→AVCC
-       conversion in processAllTracks, plus the moof/mdat box building that reads the
-       converted buffers) runs HERE on the drain thread. The writer thread only
-       receives the final combined segment buffer — an independent allocation — and
-       performs the actual I/O (segmentConsumer.accept). This is what makes
-       allocator.reset() below safe: no other thread can be reading pool memory. */
-
-    ImmutableList<ProcessedTrackInfo> trackInfos = processAllTracks();
+    /* Phase 1 (drain thread): Annex-B → AVCC conversion + per-sample metadata.
+       Everything written here lands in THIS fragment's own allocator, which is handed
+       to the writer thread with the task. Phase 2 (writer thread, buildAndEmitFragment):
+       traf/moof/mdat box construction, the multi-MB allocations that go with it, and the
+       consumer call. Fragment finalization therefore no longer blocks the encoder drain. */
+    LinearByteBufferAllocator fragmentAllocator = acquireFragmentAllocator();
+    ImmutableList<ProcessedTrackInfo> trackInfos;
+    try {
+      trackInfos = processAllTracks(fragmentAllocator);
+    } catch (RuntimeException e) {
+      releaseFragmentAllocator(fragmentAllocator);
+      throw e;
+    }
     if (trackInfos.isEmpty()) {
-      linearByteBufferAllocator.reset();
+      releaseFragmentAllocator(fragmentAllocator);
       return;
     }
 
@@ -496,38 +503,104 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
           "[AVCC-CONV] fragment#" + fragmentDiagCount + " " + perTrack.toString().trim());
     }
 
-    int fragNum = currentFragmentSequenceNumber;
-    currentFragmentSequenceNumber++;
-    long fragMaxDurationUs = getMaxTrackDurationUs(trackInfos, tracks);
+    int fragNum = currentFragmentSequenceNumber++;
+    long fragMaxDurationUs = getMaxTrackDurationUs(trackInfos);
     maxTrackDurationUs = 0;
 
-    try {
-      long fragBuildStartNs = System.nanoTime();
-      // Build moof+mdat now, while the pool is exclusively ours. combine() copies
-      // everything into a fresh independent buffer before crossing threads.
-      ImmutableList<ByteBuffer> trafBoxes = createTrafBoxes(trackInfos);
-      ByteBuffer moof = Boxes.moof(Boxes.mfhd(fragNum), trafBoxes);
-      ByteBuffer mdat = getMdatBox(trackInfos);
-      ProcessedSegment seg = new ProcessedSegment(false, fragNum,
-          fragMaxDurationUs / 1_000, combine(moof, mdat));
-      long fragBuildMs = (System.nanoTime() - fragBuildStartNs) / 1_000_000L;
-      StringBuilder sb = new StringBuilder();
+    {
+      StringBuilder prof = new StringBuilder("[FRAG-PROF] drain frag=").append(fragNum);
       for (ProcessedTrackInfo ti : trackInfos) {
+        for (Track t : tracks) {
+          if (t.id == ti.trackId) {
+            prof.append(" t").append(ti.trackId)
+                .append("(copy=").append(t.sampleCopyNanos / 1_000_000L)
+                .append("ms conv=").append(t.convertNanos / 1_000_000L).append("ms)");
+          }
+        }
+      }
+      android.util.Log.i("FragmentedMp4Writer", prof.toString());
+      for (Track t : tracks) { t.sampleCopyNanos = 0; t.convertNanos = 0; }
+    }
+
+    FragmentTask task = new FragmentTask(fragNum, fragMaxDurationUs, trackInfos, fragmentAllocator);
+    try {
+      segmentQueue.put(task);
+    } catch (InterruptedException e) {
+      releaseFragmentAllocator(fragmentAllocator);
+      Thread.currentThread().interrupt();
+      throw new IOException("Interrupted while enqueueing fragment task", e);
+    }
+  }
+
+  /** Builds the fragment boxes off the drain thread and hands the segment to the consumer. */
+  private void buildAndEmitFragment(FragmentTask task) throws IOException {
+    try {
+      long buildStartNs = System.nanoTime();
+      ImmutableList<ByteBuffer> trafBoxes = createTrafBoxes(task.trackInfos);
+      ByteBuffer moof = Boxes.moof(Boxes.mfhd(task.fragmentSequenceNumber), trafBoxes);
+      ByteBuffer mdat = getMdatBox(task.trackInfos);
+      ProcessedSegment seg =
+          new ProcessedSegment(
+              false,
+              task.fragmentSequenceNumber,
+              task.fragmentMaxDurationUs / 1_000,
+              combine(moof, mdat));
+      long buildMs = (System.nanoTime() - buildStartNs) / 1_000_000L;
+      StringBuilder sb = new StringBuilder();
+      for (ProcessedTrackInfo ti : task.trackInfos) {
         sb.append(" [t").append(ti.trackId).append("=")
-          .append(ti.pendingSamplesMetadata.size()).append("]");
+            .append(ti.pendingSamplesMetadata.size()).append("]");
       }
       android.util.Log.i(
           "FragmentedMp4Writer",
-          "[FRAG-WRITE] frag=" + fragNum + " tookMs=" + fragBuildMs
-              + " maxDurMs=" + (fragMaxDurationUs / 1000) + " tracks:" + sb);
-      segmentQueue.put(seg);
-    } catch (InterruptedException e) {
-      Thread.currentThread().interrupt();
-      throw new IOException("Interrupted while enqueueing fragment segment", e);
+          "[FRAG-WRITE] frag=" + task.fragmentSequenceNumber + " buildMs=" + buildMs
+              + " maxDurMs=" + (task.fragmentMaxDurationUs / 1000) + " tracks:" + sb);
+      segmentConsumer.accept(seg);
     } finally {
-      // Safe: the combined segment buffer is independent of the pool, and the
-      // writer thread never reads pool memory.
-      linearByteBufferAllocator.reset();
+      // Fragment finished with its allocator — return it for reuse by a later fragment.
+      releaseFragmentAllocator(task.allocator);
+    }
+  }
+
+  private LinearByteBufferAllocator acquireFragmentAllocator() {
+    synchronized (fragmentAllocatorPool) {
+      LinearByteBufferAllocator pooled = fragmentAllocatorPool.pollFirst();
+      if (pooled != null) {
+        pooled.reset();
+        return pooled;
+      }
+    }
+    return new LinearByteBufferAllocator(/* initialCapacity= */ 0);
+  }
+
+  private void releaseFragmentAllocator(LinearByteBufferAllocator allocator) {
+    if (allocator == null) {
+      return;
+    }
+    synchronized (fragmentAllocatorPool) {
+      if (fragmentAllocatorPool.size() < MAX_POOLED_ALLOCATORS) {
+        fragmentAllocatorPool.addLast(allocator);
+      }
+    }
+  }
+
+  /** One fragment's worth of work handed from the drain thread to the writer thread. */
+  private static final class FragmentTask {
+    public final int fragmentSequenceNumber;
+    public final long fragmentMaxDurationUs;
+    public final ImmutableList<ProcessedTrackInfo> trackInfos;
+    /** Owned by this fragment until the writer thread returns it to the pool. */
+    public final LinearByteBufferAllocator allocator;
+
+    public FragmentTask(
+        int fragmentSequenceNumber,
+        long fragmentMaxDurationUs,
+        ImmutableList<ProcessedTrackInfo> trackInfos,
+        LinearByteBufferAllocator allocator) {
+      this.fragmentSequenceNumber = fragmentSequenceNumber;
+      this.fragmentMaxDurationUs = fragmentMaxDurationUs;
+      this.trackInfos = trackInfos;
+      this.allocator = allocator;
     }
   }
 
@@ -575,42 +648,46 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
       }
     }
 
-    // NOTE: linearByteBufferAllocator.reset() was here but removed — it now
-    // runs on the writer thread, while processTrack() (which allocates from it)
-    // runs on the drain thread.  Resetting concurrently would be a data race.
+    // The converted sample slices belong to THIS fragment's allocator; the writer
+    // thread reads them when building the boxes, and the allocator is returned to
+    // the pool once the fragment is emitted. No cross-fragment sharing exists.
     outputBuffer.flip();
     return outputBuffer;
   }
 
-  private ImmutableList<ProcessedTrackInfo> processAllTracks() {
+  private ImmutableList<ProcessedTrackInfo> processAllTracks(
+      LinearByteBufferAllocator fragmentAllocator) {
     ImmutableList.Builder<ProcessedTrackInfo> trackInfos = new ImmutableList.Builder<>();
     for (int i = 0; i < tracks.size(); i++) {
       if (!tracks.get(i).pendingSamplesBufferInfo.isEmpty()) {
-        trackInfos.add(processTrack(/* trackId= */ i + 1, tracks.get(i)));
+        trackInfos.add(processTrack(/* trackId= */ i + 1, tracks.get(i), fragmentAllocator));
       }
     }
     return trackInfos.build();
   }
 
-  private ProcessedTrackInfo processTrack(int trackId, Track track) {
+  private ProcessedTrackInfo processTrack(
+      int trackId, Track track, LinearByteBufferAllocator fragmentAllocator) {
     checkState(track.pendingSamplesByteBuffer.size() == track.pendingSamplesBufferInfo.size());
 
     ImmutableList.Builder<ByteBuffer> pendingSamplesByteBuffer = new ImmutableList.Builder<>();
     ImmutableList.Builder<BufferInfo> pendingSamplesBufferInfoBuilder =
         new ImmutableList.Builder<>();
 
-    long fragmentStartPts = getTrackDuration(track);
+    // O(1): running counter maintained per track (was a full-history walk per fragment).
+    long fragmentStartPts = track.completedDurationVu;
     int trackPreConversionBytes = 0;
     int trackConvertedSamples = 0;
     int trackDroppedSamples = 0;
 
     
     if (doesSampleContainAnnexBNalUnits(track.format)) {
+      long convertStartNs = System.nanoTime();
       while (!track.pendingSamplesByteBuffer.isEmpty()) {
         ByteBuffer currentSampleByteBuffer = track.pendingSamplesByteBuffer.removeFirst();
         trackPreConversionBytes += currentSampleByteBuffer.remaining();
         currentSampleByteBuffer =
-            annexBToAvccConverter.process(currentSampleByteBuffer, linearByteBufferAllocator);
+            annexBToAvccConverter.process(currentSampleByteBuffer, fragmentAllocator);
         // ── AVC diagnostics: a conversion that yields ZERO bytes means the
         // converter found no NAL units (already-AVCC sample or un-splittable
         // stream) — the sample is silently lost from the file.
@@ -653,6 +730,7 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
                 currentSampleBufferInfo.flags);
         pendingSamplesBufferInfoBuilder.add(currentSampleBufferInfo);
       }
+      track.convertNanos += System.nanoTime() - convertStartNs;
     } else {
       pendingSamplesByteBuffer.addAll(track.pendingSamplesByteBuffer);
       track.pendingSamplesByteBuffer.clear();
@@ -673,6 +751,15 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
             track.videoUnitTimebase(),
             LAST_SAMPLE_DURATION_BEHAVIOR_SET_FROM_END_OF_STREAM_BUFFER_OR_DUPLICATE_PREVIOUS,
             track.endOfStreamTimestampUs);
+
+    // Advance the running duration counter and derive this fragment's duration (µs) —
+    // both O(samples in this fragment), no walk over the whole recording.
+    long fragmentDurationVu = 0;
+    for (int i = 0; i < sampleDurations.size(); i++) {
+      fragmentDurationVu += sampleDurations.get(i);
+    }
+    track.completedDurationVu = fragmentStartPts + fragmentDurationVu;
+    long fragmentDurationUs = (fragmentDurationVu * 1_000_000L) / track.videoUnitTimebase();
 
     List<Integer> sampleCompositionTimeOffsets =
         Boxes.calculateSampleCompositionTimeOffsets(
@@ -718,7 +805,8 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
         hasBFrame,
         pendingSamplesByteBuffer.build(),
         pendingSamplesMetadata.build(),
-        fragmentStartPts);
+        fragmentStartPts,
+        fragmentDurationUs);
   }
 
   private static class ProcessedTrackInfo {
@@ -729,6 +817,8 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
     public final ImmutableList<ByteBuffer> pendingSamplesByteBuffer;
     public final ImmutableList<SampleMetadata> pendingSamplesMetadata;
     public final long fragmentPts;
+    /** Duration (µs) of the samples contained in this fragment. */
+    public final long fragmentDurationUs;
 
     public ProcessedTrackInfo(
         int trackId,
@@ -737,7 +827,8 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
         boolean hasBFrame,
         ImmutableList<ByteBuffer> pendingSamplesByteBuffer,
         ImmutableList<SampleMetadata> pendingSamplesMetadata,
-        long fragmentPts
+        long fragmentPts,
+        long fragmentDurationUs
 ) {
       this.trackId = trackId;
       this.trackFormat = trackFormat;
@@ -746,6 +837,7 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
       this.pendingSamplesByteBuffer = pendingSamplesByteBuffer;
       this.pendingSamplesMetadata = pendingSamplesMetadata;
       this.fragmentPts = fragmentPts;
+      this.fragmentDurationUs = fragmentDurationUs;
     }
   }
 }

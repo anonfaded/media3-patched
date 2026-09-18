@@ -209,4 +209,47 @@ public class AnnexBUtilsTest {
 
     assertThat(output).isEqualTo(ByteBuffer.wrap(getBytesFromHexString("ABCDEF0000")));
   }
+
+  @Test
+  public void findNalUnitRanges_matchesBufferBasedFindNalUnits() {
+    java.util.Random random = new java.util.Random(42);
+    for (int trial = 0; trial < 300; trial++) {
+      // Build a synthetic Annex-B sample: NALs of random size, random start-code width.
+      java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+      int nalCount = 1 + random.nextInt(6);
+      java.util.List<int[]> expected = new java.util.ArrayList<>();
+      for (int n = 0; n < nalCount; n++) {
+        int codeWidth = (n == 0 || random.nextBoolean()) ? 3 : 4; // 00 00 01 / 00 00 00 01
+        for (int z = 0; z < codeWidth - 1; z++) {
+          out.write(0);
+        }
+        out.write(1);
+        int payloadLen = 1 + random.nextInt(64);
+        int payloadStart = out.size();
+        for (int p = 0; p < payloadLen; p++) {
+          // Avoid accidental start codes inside payloads to keep expectations simple.
+          int value = 1 + random.nextInt(254);
+          out.write(value);
+        }
+        expected.add(new int[] {payloadStart, payloadStart + payloadLen});
+      }
+      byte[] data = out.toByteArray();
+      ByteBuffer buffer = ByteBuffer.wrap(data);
+      ImmutableList<ByteBuffer> viaBuffer = AnnexBUtils.findNalUnits(buffer);
+      int[] viaArray = AnnexBUtils.findNalUnitRanges(data, 0, data.length);
+      assertThat(viaBuffer.size()).isEqualTo(expected.size());
+      assertThat(viaArray.length).isEqualTo(expected.size() * 2);
+      for (int i = 0; i < expected.size(); i++) {
+        byte[] oldBytes = new byte[viaBuffer.get(i).remaining()];
+        viaBuffer.get(i).duplicate().get(oldBytes);
+        int start = viaArray[i * 2];
+        int len = viaArray[i * 2 + 1] - start;
+        assertThat(oldBytes.length).isEqualTo(expected.get(i)[1] - expected.get(i)[0]);
+        assertThat(len).isEqualTo(oldBytes.length);
+        for (int b = 0; b < len; b++) {
+          assertThat(data[start + b]).isEqualTo(oldBytes[b]);
+        }
+      }
+    }
+  }
 }

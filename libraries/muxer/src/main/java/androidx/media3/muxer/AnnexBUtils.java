@@ -225,6 +225,121 @@ import java.nio.ByteOrder;
     return input.limit();
   }
 
+  /**
+   * Byte-array NAL range finder — identical rules to {@link #findNalUnits(ByteBuffer)}, but the
+   * scan runs on a plain {@code byte[]} instead of absolute reads on a (direct) {@link ByteBuffer}.
+   *
+   * <p>The buffer-based scan measured ~35 MB/s on device (per-4-byte {@code getInt(index)} calls),
+   * which made Annex-B → AVCC conversion of a 4K60 fragment (~15 MB) take ~400 ms on the encoder
+   * drain thread — long enough that the drain could not release MediaCodec output buffers, the
+   * encoder stalled, and every fragment boundary showed up as a frame freeze. Array indexing runs
+   * at memory bandwidth instead.
+   *
+   * <p>Returns pairs of {@code (start, end)} absolute indices into {@code data}; an empty array
+   * means "no Annex-B start code found" (the caller passes such samples through unchanged).
+   */
+  public static int[] findNalUnitRanges(byte[] data, int offset, int length) {
+    int end = offset + length;
+    int firstStartCode = skipLeadingZerosArray(data, offset, end);
+    if (firstStartCode < 0) {
+      return EMPTY_RANGES;
+    }
+    int[] ranges = new int[16];
+    int count = 0;
+    int cursor = firstStartCode + THREE_BYTE_NAL_START_CODE_SIZE;
+    while (cursor < end) {
+      int nalEnd = findNalEndArray(data, cursor, end);
+      if (count + 2 > ranges.length) {
+        ranges = java.util.Arrays.copyOf(ranges, ranges.length * 2);
+      }
+      ranges[count++] = cursor;
+      ranges[count++] = nalEnd;
+      int nextStartCode = skipLeadingZerosArray(data, nalEnd, end);
+      if (nextStartCode < 0) {
+        break;
+      }
+      cursor = nextStartCode + THREE_BYTE_NAL_START_CODE_SIZE;
+    }
+    return java.util.Arrays.copyOf(ranges, count);
+  }
+
+  private static final int[] EMPTY_RANGES = new int[0];
+
+  /**
+   * Array port of {@link #skipLeadingZerosAndFindNalStartCodeIndex(ByteBuffer, int)}. Returns the
+   * index where a {@code 0x000001} start code begins, or {@code -1} when the remaining bytes are
+   * not a valid start-code prefix (caller treats it as "not Annex-B").
+   */
+  private static int skipLeadingZerosArray(byte[] d, int index, int end) {
+    while (index <= end - 4) {
+      int b0 = d[index] & 0xFF;
+      int b1 = d[index + 1] & 0xFF;
+      int b2 = d[index + 2] & 0xFF;
+      int b3 = d[index + 3] & 0xFF;
+      if (b0 == 0 && b1 == 0 && b2 == 1) {
+        return index;
+      }
+      if (b0 != 0 || b1 != 0 || b2 != 0) {
+        return -1;
+      }
+      if (b3 == 1) {
+        return index + 1;
+      }
+      if (b3 != 0) {
+        return -1;
+      }
+      index++;
+    }
+    if (index <= end - THREE_BYTE_NAL_START_CODE_SIZE) {
+      if ((d[index] & 0xFF) != 0 || (d[index + 1] & 0xFF) != 0) {
+        return -1;
+      }
+      // A start code needs the trailing 0x01; anything else is not Annex-B.
+      return (d[index + 2] & 0xFF) == 1 ? index : -1;
+    }
+    while (index < end) {
+      if ((d[index] & 0xFF) != 0) {
+        return -1;
+      }
+      index++;
+    }
+    return -1;
+  }
+
+  /**
+   * Array port of {@link #findNalEndIndex(ByteBuffer, int)}: returns the index at which the current
+   * NAL unit ends (exclusive), i.e. where the next start code's zero run begins.
+   */
+  private static int findNalEndArray(byte[] d, int index, int end) {
+    while (index <= end - 4) {
+      int b0 = d[index] & 0xFF;
+      int b1 = d[index + 1] & 0xFF;
+      int b2 = d[index + 2] & 0xFF;
+      int b3 = d[index + 3] & 0xFF;
+      if (b0 == 0 && b1 == 0 && (b2 == 0 || b2 == 1)) {
+        return index;
+      }
+      if (b1 == 0 && b2 == 0 && (b3 == 0 || b3 == 1)) {
+        return index + 1;
+      }
+      if (b2 == 0 && b3 == 0) {
+        index += 2;
+      } else if (b3 == 0) {
+        index += 3;
+      } else {
+        index += 4;
+      }
+    }
+    if (index == end - THREE_BYTE_NAL_START_CODE_SIZE) {
+      if ((d[index] & 0xFF) == 0
+          && (d[index + 1] & 0xFF) == 0
+          && ((d[index + 2] & 0xFF) == 0 || (d[index + 2] & 0xFF) == 1)) {
+        return index;
+      }
+    }
+    return end;
+  }
+
   private static ByteBuffer getBytes(ByteBuffer buf, int offset, int length) {
     ByteBuffer result = buf.duplicate();
     result.position(offset);

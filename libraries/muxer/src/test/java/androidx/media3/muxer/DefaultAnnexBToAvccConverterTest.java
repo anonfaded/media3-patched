@@ -66,11 +66,19 @@ public final class DefaultAnnexBToAvccConverterTest {
   }
 
   @Test
-  public void convertAnnexBToAvcc_noNalUnit_throws() {
+  public void convertAnnexBToAvcc_noNalUnit_passesThroughUnchanged() {
+    // Patched (FadCam fork) contract: a sample without Annex-B start codes is already
+    // length-prefixed (AVCC) and must be passed through untouched. Throwing here used to abort
+    // the whole recording when an encoder emitted a mixed Annex-B/AVCC stream, and converting it
+    // would have produced a zero-length sample that the writer then dropped.
     ByteBuffer input = generateFakeNalUnitData(1000);
+    ByteBuffer inputCopy = input.duplicate();
 
     AnnexBToAvccConverter annexBToAvccConverter = AnnexBToAvccConverter.DEFAULT;
-    assertThrows(IllegalStateException.class, () -> annexBToAvccConverter.process(input));
+    ByteBuffer result = annexBToAvccConverter.process(input);
+
+    assertThat(result).isSameInstanceAs(input);
+    assertThat(result).isEqualTo(inputCopy);
   }
 
   @Test
